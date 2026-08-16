@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Mail, Check, Loader2 } from 'lucide-react';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/auth-context';
 import Modal from './ui/Modal';
 
 // Sign-in modal: magic link (email) + Google OAuth.

@@ -21,8 +21,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
+from starlette.requests import Request as StarletteRequest
 from pydantic import BaseModel
+
+# Raise the multipart per-part size limit (default 1 MB) so that text form
+# fields carrying base64 logos inside the branding JSON are not rejected.
+_MAX_PART_SIZE = 10 * 1024 * 1024  # 10 MB
+_original_form = StarletteRequest.form
+
+
+def _form_with_larger_parts(self, *args, **kwargs):
+    kwargs.setdefault("max_part_size", _MAX_PART_SIZE)
+    return _original_form(self, *args, **kwargs)
+
+
+StarletteRequest.form = _form_with_larger_parts
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from render_options import (RenderOptions, BrandingConfig, LogoOverlay, load_options, save_options,
+                            resolve_options, resolve_branding, rebrand_clip, deep_merge, apply_branding,
+                            load_branding, save_branding, resolve_cascade, render_options_to_operations)
+import autopilot as autopilot_mod
 
 load_dotenv()
 
@@ -36,7 +54,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
-JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", "3600"))  # job/file retention (issue #46)
+JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", "86400"))  # job/file retention: 24 hours (issue #46)
 # Ceiling for the working directory once it lives on a persistent volume: the
 # age-based sweep alone can't stop a burst of long videos from filling the disk.
 # 0 disables the cap.
@@ -71,6 +89,27 @@ else:
     async def get_current_user_optional(request: Request):
         # No-op dependency in self-host mode: every request is anonymous / BYOK.
         return None
+
+
+# ---- Automated social publishing ----------------------------------------------
+# Same pattern as `cloud/`: everything lives in the optional `publishing/` package
+# and is imported ONLY when the flag is on, so an instance that doesn't publish
+# never needs Postgres, `cryptography`, or a master key. Independent of
+# BILLING_ENABLED — publishing works in either mode.
+PUBLISHING_ENABLED = os.environ.get("PUBLISHING_ENABLED", "").lower() in ("1", "true", "yes")
+
+if PUBLISHING_ENABLED:
+    import publishing
+    # Imported by name rather than reached for as `publishing.clips` later: the
+    # package binds its submodules as a side effect of setup_sync, and depending
+    # on that ordering is how a rename turns into an AttributeError at startup.
+    from publishing import clips as publish_clips, media as publish_media
+    from publishing.crypto import SECRET_PATTERNS as _PUBLISH_SECRET_PATTERNS
+else:
+    publishing = None
+    publish_clips = None
+    publish_media = None
+    _PUBLISH_SECRET_PATTERNS = []
 
 
 async def _user_from_request(request: Request):
@@ -114,6 +153,37 @@ async def resolve_upload_post(request: Request, body_key: Optional[str] = None):
     header = request.headers.get("X-Upload-Post-Key")
     key = header or body_key or os.environ.get("UPLOAD_POST_API_KEY")
     return key, None
+
+
+async def resolve_llm_env(request: Request) -> Optional[dict]:
+    """Resolve LLM provider env vars for the processing subprocess.
+
+    Returns a dict of env vars to inject, or None if no valid config found.
+    Backward compatible: X-Gemini-Key alone still works (maps to gemini provider).
+    """
+    provider = request.headers.get("X-LLM-Provider", "")
+    base_url = request.headers.get("X-LLM-Base-URL", "")
+    llm_key = request.headers.get("X-LLM-Key", "")
+    model = request.headers.get("X-LLM-Model", "")
+
+    if provider == "openai_compat":
+        if not base_url or not model:
+            return None
+        return {
+            "LLM_PROVIDER": "openai_compat",
+            "OPENAI_BASE_URL": base_url,
+            "OPENAI_API_KEY": llm_key or "no-key",
+            "OPENAI_MODEL": model,
+        }
+
+    # Default: gemini (backward compat with X-Gemini-Key)
+    api_key = await resolve_gemini(request)
+    if not api_key:
+        return None
+    env = {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": api_key}
+    if model:
+        env["GEMINI_MODEL"] = model
+    return env
 
 
 def gemini_missing_error():
@@ -369,6 +439,11 @@ def _recover_jobs_from_disk():
         job_path = os.path.join(OUTPUT_DIR, job_id)
         if not os.path.isdir(job_path) or job_id in jobs:
             continue
+        # A live resume manifest means the job was interrupted mid-run. Leave it
+        # for _resume_interrupted_jobs (called right after) so a partially-clipped
+        # job resumes instead of being surfaced as 'completed' with missing clips.
+        if os.path.isfile(os.path.join(job_path, _RESUME_FILE)):
+            continue
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
         if not json_files:
             continue
@@ -438,9 +513,12 @@ def _clear_resume_manifest(job_id):
 def _resume_interrupted_jobs() -> set:
     """Re-enqueue jobs that were mid-processing when the server last stopped.
 
-    Runs after _recover_jobs_from_disk: a job whose clips already finished has a
-    metadata JSON and is recovered as 'completed', so we only resume manifests
-    with no metadata yet (analysis never finished).
+    A job is "interrupted" iff it still has a .resume.json manifest: the manifest
+    is cleared only on a terminal subprocess exit (run_job_wrapper), so its
+    survival means the worker was killed mid-run. We resume regardless of whether
+    *_metadata.json exists — analysis may have finished but clipping did not. The
+    re-run is cheap because transcript, scoring/detail missions, and any finished
+    clips all load from their on-disk checkpoints; only the incomplete work runs.
 
     Returns the set of reservation ids for the resumed jobs, so the caller can
     keep them out of the orphaned-reservation refund. Does NO DB work — the DB
@@ -459,10 +537,13 @@ def _resume_interrupted_jobs() -> set:
         manifest_path = os.path.join(job_path, _RESUME_FILE)
         if not os.path.isfile(manifest_path):
             continue
-        # Already finished generating clips → recovered as completed elsewhere.
-        if glob.glob(os.path.join(job_path, "*_metadata.json")):
-            _clear_resume_manifest(job_id)
-            continue
+        # NOTE: presence of the manifest — not of *_metadata.json — is the true
+        # "was interrupted" signal. run_job_wrapper clears the manifest on any
+        # terminal exit, so a manifest that survives means the worker died
+        # mid-run. Metadata is written before clips render (main.py), so a crash
+        # during clipping leaves metadata + a live manifest: we must resume it,
+        # not treat it as done. Re-running is cheap now — transcript, analysis
+        # missions, and finished clips all load from their checkpoints.
         try:
             with open(manifest_path) as f:
                 m = json.load(f)
@@ -530,6 +611,25 @@ def _dir_size(path: str) -> int:
     return total
 
 
+def _active_input_paths():
+    """Absolute paths of source files that queued/processing jobs are using.
+
+    Ownership comes from each job's actual command (the token after -i), which
+    is authoritative — unlike parsing the filename prefix, it can't be fooled by
+    an assembled-upload id that differs from the job id. Used by both cleanup
+    sweeps so an in-use source is never deleted mid-run.
+    """
+    paths = set()
+    for jdata in jobs.values():
+        if jdata.get('status') not in ('queued', 'processing'):
+            continue
+        cmd = jdata.get('cmd') or []
+        for i, tok in enumerate(cmd):
+            if tok == '-i' and i + 1 < len(cmd):
+                paths.add(os.path.abspath(cmd[i + 1]))
+    return paths
+
+
 def _enforce_uploads_size_cap():
     """Delete the oldest source uploads while UPLOAD_DIR is over UPLOADS_MAX_GB.
 
@@ -542,6 +642,9 @@ def _enforce_uploads_size_cap():
     used = _dir_size(UPLOAD_DIR)
     if used <= cap:
         return
+    # Never trim a source an active job is still reading (right up until the
+    # final clip is cut). Ownership comes from the job command, not the filename.
+    protected = _active_input_paths()
     files = []
     for name in os.listdir(UPLOAD_DIR):
         p = os.path.join(UPLOAD_DIR, name)
@@ -555,6 +658,8 @@ def _enforce_uploads_size_cap():
     for _mtime, path, size in files:
         if used <= cap:
             break
+        if os.path.abspath(path) in protected:
+            continue
         try:
             os.remove(path)
             used -= size
@@ -587,6 +692,9 @@ def _enforce_output_size_cap():
     for _mtime, path, job_id in candidates:
         if used <= cap:
             break
+        # Never purge jobs that are still queued or processing
+        if jobs.get(job_id, {}).get('status') in ('queued', 'processing'):
+            continue
         size = _dir_size(path)
         shutil.rmtree(path, ignore_errors=True)
         jobs.pop(job_id, None)
@@ -610,6 +718,25 @@ async def cleanup_jobs():
                 # deleting it would 500 every /thumbnails request until reboot.
                 if job_id == os.path.basename(THUMBNAILS_DIR):
                     continue
+                # Never purge jobs that are still queued or processing
+                job_rec = jobs.get(job_id, {})
+                job_status = job_rec.get('status')
+                if job_status in ('queued', 'processing'):
+                    continue
+                # Nor a completed job whose post-clip batch is still running —
+                # this covers autopilot auto-styling, which happens after the
+                # job reports 'completed'. Purging mid-batch would rmtree the
+                # clips out from under the ffmpeg passes.
+                _batch = job_rec.get('batch')
+                if _batch is not None and getattr(_batch, 'status', None) == 'running':
+                    continue
+                # Nor an autopilot child whose parent batch is still active
+                # (queued children not yet started have no 'batch' attached).
+                _ap_id = job_rec.get('autopilot_batch_id')
+                if _ap_id and not autopilot_mod.is_cancelled(_ap_id):
+                    _ap = autopilot_mod.autopilot_batches.get(_ap_id)
+                    if _ap and _ap.get('status') == 'running':
+                        continue
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
                     if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
@@ -640,9 +767,25 @@ async def cleanup_jobs():
             except NameError:
                 pass
 
-            # Cleanup Uploads
+            # Cleanup terminal autopilot batch records from memory (child job
+            # dirs are swept by the per-job logic above; this only drops the
+            # in-memory parent record once it's done and past retention).
+            try:
+                autopilot_mod.cleanup_expired(jobs, JOB_RETENTION_SECONDS)
+            except Exception:
+                pass
+
+            # Cleanup Uploads (skip files belonging to active jobs).
+            # Ownership is taken from each active job's actual command (the -i
+            # input path), not parsed from the filename — the assembled upload
+            # id and the job id don't always match, and a job can outlive the
+            # retention window (a long transcription alone can exceed it). An
+            # in-use source must never be deleted mid-run regardless of age.
+            protected = _active_input_paths()
             for filename in os.listdir(UPLOAD_DIR):
                 file_path = os.path.join(UPLOAD_DIR, filename)
+                if os.path.abspath(file_path) in protected:
+                    continue
                 try:
                     if now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
                          os.remove(file_path)
@@ -765,6 +908,177 @@ def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
     asyncio.create_task(_run())
 
 
+def _resolve_clip_for_publishing(job_id: str, clip_index: int):
+    """Answer publishing/clips.py's one question: where are this clip's bytes?
+
+    Registered at startup rather than imported, because the job store lives in
+    this module's memory and `publishing` must not import `app`.
+
+    Reads the LIVE job record, so a clip that was subtitled/hooked/re-styled
+    after generation publishes in its current form — the same reason the edit
+    endpoints write `video_url` back into `job['result']['clips']`. Returns None
+    when the job or the file is gone (retention sweeps clips after 24 h), which
+    the dispatcher treats as a permanent, non-retryable reason.
+    """
+    if not PUBLISHING_ENABLED:
+        return None
+    job = jobs.get(job_id) or {}
+    clips = (job.get('result') or {}).get('clips') or []
+    if clip_index < 0 or clip_index >= len(clips):
+        return None
+    clip = clips[clip_index]
+
+    info = publish_media.describe_clip(OUTPUT_DIR, job_id, clip_index, clip)
+    if not info.get("exists"):
+        return None
+
+    title = (clip.get('video_title_for_youtube_short')
+             or clip.get('title') or "")
+    return {
+        # The BASE directory, not the job's — clip_local_path() joins the job id
+        # itself, so handing it output/<job_id> would look under it twice.
+        "output_dir": OUTPUT_DIR,
+        "filename": info["filename"],
+        "user_id": job.get('user_id'),
+        "title": title,
+        "caption": clip.get('video_description_for_instagram') or title,
+        "duration": info.get("duration_seconds"),
+        "size_bytes": info.get("size_bytes"),
+        "mtime": info.get("mtime"),
+        "fingerprint": info.get("fingerprint"),
+        # The pipeline already writes one text per platform; passing them through
+        # is what stops a 3-account fan-out from using a YouTube title as an
+        # Instagram caption.
+        "per_platform": {
+            "youtube": {"title": title, "caption": title},
+            "instagram": {
+                "caption": clip.get('video_description_for_instagram') or title},
+            "tiktok": {
+                "caption": clip.get('video_description_for_tiktok') or title},
+        },
+    }
+
+
+def _schedule_autopublish(job_id: str, clip_count: int, loop):
+    """Hand a finished, styled job to the publishing planner.
+
+    Called from the autopilot styling thread, so the coroutine is scheduled back
+    onto the event loop rather than awaited. A no-op unless publishing is enabled
+    AND the batch was submitted with a publish plan, which is what keeps every
+    existing autopilot batch's behaviour byte-for-byte unchanged.
+    """
+    if not PUBLISHING_ENABLED or loop is None:
+        return
+    try:
+        plan = autopilot_mod.publish_plan_for_job(job_id)
+        if not plan:
+            return
+        from publishing import autopublish
+        user_id = (jobs.get(job_id) or {}).get('user_id')
+
+        async def _run():
+            report = await autopublish.publish_job_clips(
+                job_id, clip_count, plan, user_id=user_id)
+            job = jobs.get(job_id)
+            if job is not None:
+                n = len(report.get('created') or [])
+                skipped = len(report.get('skipped') or [])
+                job.setdefault('logs', []).append(
+                    f"Publishing: {n} post(s) scheduled"
+                    + (f", {skipped} clip(s) skipped." if skipped else "."))
+
+        asyncio.run_coroutine_threadsafe(_run(), loop)
+    except Exception as e:
+        # Styling finished and the clips are downloadable; a publishing seam
+        # failure must not change that.
+        print(f"⚠️  Publishing: could not schedule auto-publish for {job_id}: {e}")
+
+
+def _maybe_autopilot_apply(job_id: str, clip_count: int, loop):
+    """Auto-run the batch pipeline on a finished autopilot child job.
+
+    Flag-gated: if the job carries no autopilot_batch_id this is a no-op, so a
+    normal job's completion path is byte-for-byte unchanged. Fires the existing
+    run_batch in a daemon thread (exactly like start_batch) and does NOT await —
+    the run_job_wrapper finally (archive/notify/semaphore) must not be delayed.
+
+    Keys are sourced server-side, not from request headers (there is no request
+    here, hours after submit): the Gemini key from the job's own env, the
+    ElevenLabs key from the in-memory autopilot batch record. After the batch
+    finishes, a durable R2 re-archive is scheduled back on the event loop, since
+    run_batch's per-clip archive_fn is a no-op from a worker thread.
+    """
+    job = jobs.get(job_id) or {}
+    batch_id = job.get('autopilot_batch_id')
+    if not batch_id:
+        return  # not an autopilot child — nothing to do
+
+    # job['autopilot_styling'] tells the board whether a per-clip batch is still
+    # coming. Without it, a child that needs no styling would sit at clips_ready
+    # forever (that stage is non-terminal), so the batch would never complete.
+    if autopilot_mod.is_cancelled(batch_id):
+        job['autopilot_styling'] = 'skipped'
+        job.setdefault('logs', []).append("Autopilot batch cancelled; skipping auto-styling.")
+        return
+
+    output_dir = job.get('output_dir') or os.path.join(OUTPUT_DIR, job_id)
+    try:
+        default, _overrides = load_options(output_dir)
+    except Exception as e:
+        # Clips are finished and reviewable; only the styling recipe is lost.
+        job['autopilot_styling'] = 'skipped'
+        job.setdefault('logs', []).append(
+            "Autopilot: styling recipe unreadable; clips left unstyled.")
+        print(f"⚠️ autopilot: could not load render options for {job_id}: {e}")
+        return
+
+    ap_keys = autopilot_mod.keys_for_job(job_id)
+    # auto_edit (editor.py) talks to Gemini directly, whatever the general
+    # pipeline runs on. Under an OpenAI-compatible provider the child env has no
+    # GEMINI_API_KEY at all, so fall back to the key the batch captured at
+    # creation — otherwise auto_edit would fire with api_key=None.
+    gemini_key = (job.get('env') or {}).get('GEMINI_API_KEY') or ap_keys.get('gemini')
+    elevenlabs_key = ap_keys.get('elevenlabs')
+    operations = render_options_to_operations(
+        default, gemini_key=gemini_key, elevenlabs_key=elevenlabs_key)
+    if not operations:
+        # Recipe styled nothing (all modules off) — clips are already final, so
+        # this is a legitimate point to publish from. Deliberately NOT done on
+        # the recipe-unreadable path above: posting unbranded clips to real
+        # accounts is the wrong response to an error.
+        job['autopilot_styling'] = 'skipped'
+        _schedule_autopublish(job_id, clip_count, loop)
+        return
+
+    from batch import run_batch as _run_batch
+
+    def _worker():
+        try:
+            _run_batch(job_id, list(range(clip_count)), operations, output_dir,
+                       jobs, _archive_clip_edit_bg)
+        except Exception as e:
+            print(f"⚠️ autopilot: auto-batch failed for {job_id}: {e}")
+        finally:
+            # run_batch's per-clip archive_fn can't schedule tasks from this
+            # thread; do the durable R2 re-archive here, on the event loop, so
+            # the library reflects the post-styling video_urls.
+            if BILLING_ENABLED and loop is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(_archive_managed_job(job_id), loop)
+                except Exception as e:
+                    print(f"⚠️ autopilot: re-archive schedule failed for {job_id}: {e}")
+            # Auto-publish, if this batch was submitted with a plan. HERE and not
+            # in run_job_wrapper's finally: that one runs the moment the clips
+            # render, before styling, so it would publish the unstyled cut.
+            _schedule_autopublish(job_id, clip_count, loop)
+
+    job['autopilot_styling'] = 'running'
+    job.setdefault('logs', []).append(
+        f"Autopilot: auto-applying {len(operations)} operation(s) to {clip_count} clip(s).")
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
 async def _notify_clips_ready(job_id):
     """Email the owner when their clips finish — processing takes minutes, so
     this lets them close the tab. Once per job (email_sent flag)."""
@@ -877,6 +1191,11 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(cleanup_jobs())
     if BILLING_ENABLED:
         await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
+    if PUBLISHING_ENABLED:
+        # Registered before the loops start so a due attempt claimed on the very
+        # first dispatch tick can already resolve its clip.
+        publish_clips.set_resolver(_resolve_clip_for_publishing)
+        await publishing.setup_async(app)
     yield
     # Cleanup (optional: cancel worker)
 
@@ -885,6 +1204,11 @@ app = FastAPI(lifespan=lifespan)
 # Cloud mode: attach middleware + routers at import time (before the app serves).
 if BILLING_ENABLED:
     cloud.setup_sync(app)
+
+# Publishing routers, likewise at import time. validate_required() runs in here,
+# so a misconfigured deploy fails at boot rather than at the first publish.
+if PUBLISHING_ENABLED:
+    publishing.setup_sync(app)
 
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
@@ -928,7 +1252,14 @@ _CREDENTIAL_URL_RE = re.compile(r'(\w+://)[^:/@\s]+:[^@/\s]+@')
 
 
 def _scrub_secrets(line: str) -> str:
-    return _CREDENTIAL_URL_RE.sub(r'\1***:***@', line)
+    line = _CREDENTIAL_URL_RE.sub(r'\1***:***@', line)
+    # Provider API keys (Status 200's `rl_*`) can reach a log line through an
+    # httpx error string. The patterns come from publishing.crypto so there is
+    # one definition of what a provider secret looks like; the list is empty
+    # when publishing is off, making this a no-op.
+    for pat in _PUBLISH_SECRET_PATTERNS:
+        line = pat.sub(lambda m: m.group(0)[:6] + "…redacted", line)
+    return line
 
 
 # Cloud users don't need (and shouldn't see) implementation details: the ingest
@@ -1073,16 +1404,43 @@ async def run_job(job_id, job_data):
                 with open(target_json, 'r') as f:
                     data = json.load(f)
                 
-                # Enhance result with video URLs
+                # Enhance result with video URLs. The metadata lists every clip
+                # the LLM *planned*; only report the ones whose .mp4 actually
+                # rendered to disk. Otherwise a failed cut (e.g. missing source)
+                # surfaces as a gray, unplayable card that 404s on /videos/...
                 base_name = os.path.basename(target_json).replace('_metadata.json', '')
                 clips = data.get('shorts', [])
                 cost_analysis = data.get('cost_analysis')
 
+                ready_clips = []
                 for i, clip in enumerate(clips):
                      clip_filename = f"{base_name}_clip_{i+1}.mp4"
-                     clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                
-                jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+                     clip_path = os.path.join(output_dir, clip_filename)
+                     if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                         clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+                         ready_clips.append(clip)
+
+                if ready_clips:
+                    jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
+                    # Autopilot: if this job is an autopilot child, auto-run the
+                    # batch pipeline on its clips using the saved recipe. No-op
+                    # (flag-gated) for every normal job. Fire-and-don't-await.
+                    try:
+                        _maybe_autopilot_apply(job_id, len(ready_clips),
+                                               asyncio.get_event_loop())
+                    except Exception as e:
+                        # Includes the case where the seam never ran (the loop
+                        # argument is evaluated first), so mark styling settled
+                        # here too or the board would wait on a batch that is
+                        # never coming.
+                        jobs[job_id]['autopilot_styling'] = 'skipped'
+                        jobs[job_id]['logs'].append(
+                            _scrub_secrets(f"Autopilot auto-apply skipped: {e}"))
+                else:
+                    # Exit code was 0 but nothing landed on disk — treat as failure
+                    # rather than reporting phantom clips.
+                    jobs[job_id]['status'] = 'failed'
+                    jobs[job_id]['logs'].append("No clip files were produced.")
             else:
                  jobs[job_id]['status'] = 'failed'
                  jobs[job_id]['logs'].append("No metadata file generated.")
@@ -1126,62 +1484,205 @@ async def _probe_youtube_quality(url: str) -> dict:
     return await loop.run_in_executor(None, _run)
 
 
-@app.post("/api/process")
-async def process_endpoint(
-    request: Request,
-    file: Optional[UploadFile] = File(None),
-    url: Optional[str] = Form(None),
-    acknowledged: Optional[str] = Form(None),
-    output_format: Optional[str] = Form(None),
-    force_low_quality: Optional[str] = Form(None)
+# Chunked upload state (in-memory, keyed by upload_id)
+_chunked_uploads: Dict[str, Dict] = {}
+
+@app.post("/api/upload/chunk")
+async def upload_chunk(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    chunk: UploadFile = File(...),
 ):
-    api_key = await resolve_gemini(request)
-    if not api_key:
-        raise gemini_missing_error()
+    """Receive a single chunk of a large file upload."""
+    if upload_id not in _chunked_uploads:
+        _chunked_uploads[upload_id] = {
+            "chunks": {},
+            "total_chunks": total_chunks,
+            "filename": chunk.filename,
+            "started_at": time.time(),
+        }
 
-    ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
-    force_low = str(force_low_quality).lower() in ("1", "true", "yes")
+    # Save chunk to disk
+    upload_info = _chunked_uploads[upload_id]
+    chunk_path = os.path.join(UPLOAD_DIR, f"chunk_{upload_id}_{chunk_index}")
 
-    # Handle JSON body manually for URL payload
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        body = await request.json()
-        url = body.get("url")
-        ack_flag = bool(body.get("acknowledged"))
-        force_low = bool(body.get("force_low_quality"))
-        output_format = body.get("output_format")
+    with open(chunk_path, "wb") as f:
+        content = await chunk.read()
+        f.write(content)
 
-    # Normalize output format (auto = keep pipeline default).
-    if output_format not in ("vertical", "horizontal", "square"):
-        output_format = "auto"
+    upload_info["chunks"][chunk_index] = chunk_path
 
-    if not url and not file:
-        raise HTTPException(status_code=400, detail="Must provide URL or File")
+    received = len(upload_info["chunks"])
+    print(f"📦 Chunk {chunk_index + 1}/{total_chunks} received ({received}/{total_chunks} total)")
 
+    return {
+        "upload_id": upload_id,
+        "chunk_index": chunk_index,
+        "status": "received",
+        "chunks_received": received,
+        "chunks_total": total_chunks,
+    }
+
+
+@app.post("/api/upload/complete")
+async def complete_upload(
+    upload_id: str = Form(...),
+    acknowledged: str = Form(...),
+    output_format: Optional[str] = Form(None),
+    reframe_mode: Optional[str] = Form(None),
+    clip_duration_mode: Optional[str] = Form(None),
+    branding: Optional[str] = Form(None),
+    request: Request = None,
+):
+    """Assemble chunks and start processing."""
+    if upload_id not in _chunked_uploads:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    upload_info = _chunked_uploads[upload_id]
+
+    if len(upload_info["chunks"]) != upload_info["total_chunks"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing chunks: {len(upload_info['chunks'])}/{upload_info['total_chunks']}"
+        )
+
+    # Assemble chunks into final file.
+    # Name the assembled file with the job_id (not the upload_id) so the uploads
+    # cleanup sweep — which derives ownership from filename.split('_')[0] — can
+    # match it against the set of active jobs and never delete a source file
+    # while its job is still processing.
+    filename = upload_info["filename"]
+    job_id = str(uuid.uuid4())
+    final_path = os.path.join(UPLOAD_DIR, f"{job_id}_{filename}")
+
+    print(f"🔧 Assembling {upload_info['total_chunks']} chunks into {filename}...")
+
+    try:
+        with open(final_path, "wb") as out_file:
+            for i in range(upload_info["total_chunks"]):
+                chunk_path = upload_info["chunks"][i]
+                with open(chunk_path, "rb") as chunk_file:
+                    while content := chunk_file.read(1024 * 1024):  # 1MB at a time
+                        out_file.write(content)
+                os.remove(chunk_path)  # Clean up chunk
+
+        # Clean up upload tracking
+        del _chunked_uploads[upload_id]
+
+        file_size = os.path.getsize(final_path)
+        print(f"✅ Upload complete: {file_size / (1024*1024):.1f}MB")
+
+        # Verify file exists and has content
+        if not os.path.exists(final_path) or file_size == 0:
+            raise HTTPException(status_code=500, detail="File assembly failed - empty file")
+
+        # Now process the assembled file inline (similar to process_endpoint)
+        ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
+        if not ack_flag:
+            raise HTTPException(status_code=400, detail="You must confirm you own the content.")
+
+        # Capture attestation
+        client_ip = request.client.host if request.client else "unknown"
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            client_ip = fwd.split(",")[0].strip()
+        user_agent = request.headers.get("user-agent", "")
+        attestation = {
+            "acknowledged": True,
+            "ip": client_ip,
+            "user_agent": user_agent,
+            "timestamp": time.time(),
+            "source": "file",
+        }
+
+        # job_id was generated above so the assembled upload is named after it.
+        job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+        os.makedirs(job_output_dir, exist_ok=True)
+
+        # Prepare command
+        cmd = ["python", "-u", "main.py", "-i", final_path, "-o", job_output_dir]
+        if output_format and output_format != "auto":
+            cmd.extend(["--format", output_format])
+        if reframe_mode in ("track", "general"):
+            cmd.extend(["--reframe-mode", reframe_mode])
+        if clip_duration_mode == "short":
+            cmd.extend(["--clip-duration", clip_duration_mode])
+
+        # Resolve LLM environment
+        llm_env = await resolve_llm_env(request)
+        if not llm_env:
+            raise gemini_missing_error()
+
+        env = os.environ.copy()
+        env.update(llm_env)
+
+        print(f"[attestation] job={job_id} ip={attestation['ip']} source=file ack=true")
+
+        # Create job record
+        jobs[job_id] = {
+            'status': 'queued',
+            'logs': [f"Job {job_id} queued."],
+            'cmd': cmd,
+            'env': env,
+            'output_dir': job_output_dir,
+            'attestation': attestation,
+        }
+
+        _enqueue_job(job_id, 2)  # Default priority
+
+        print(f"✅ Job created: {job_id}")
+        return {"job_id": job_id, "status": "queued"}
+
+    except Exception as e:
+        print(f"❌ Assembly error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+
+async def _create_and_enqueue_job(
+    request: Request,
+    input_path: Optional[str],
+    url: Optional[str],
+    ack_flag: bool,
+    output_format: str,
+    branding_payload: Optional[dict],
+    force_low: bool,
+    job_id: Optional[str] = None,
+    reframe_mode: str = "auto",
+    clip_duration_mode: str = "auto",
+    autopilot_batch_id: Optional[str] = None
+) -> dict:
+    """Create a job record, persist owner info, and enqueue for processing.
+
+    autopilot_batch_id (optional): when set, flags the job as an autopilot child.
+    After its clips finalize, run_job auto-runs the batch pipeline using the
+    recipe already saved to the job's render_options.json. Absent = today's
+    behavior, byte-for-byte.
+    """
     if not ack_flag:
         raise HTTPException(status_code=400, detail="You must confirm you own the content or have rights to process it.")
 
     if url and DISABLE_YOUTUBE_URL:
         raise HTTPException(status_code=403, detail="YouTube URL ingest is disabled on this deployment. Please upload a file you own.")
 
-    # Pre-flight quality gate: probe the offered resolution BEFORE starting, so
-    # the user can abort (refresh cookies / update yt-dlp) instead of burning
-    # 20 min on a 360p-only source. Fail-open: any probe error starts normally.
+    # Pre-flight quality gate (URLs only)
     if url and not force_low and QUALITY_GATE_MIN_HEIGHT > 0:
         probe = await _probe_youtube_quality(url)
         max_height = int(probe.get("max_height") or 0)
         if 0 < max_height < QUALITY_GATE_MIN_HEIGHT:
             print(f"⚠️ Quality gate: only {max_height}p available for {url} — asking user first.")
-            return JSONResponse({
+            return {
                 "needs_confirmation": True,
                 "quality_check": {
                     "max_height": max_height,
                     "min_height": QUALITY_GATE_MIN_HEIGHT,
                     "cookies_invalid": bool(probe.get("cookies_invalid")),
                 },
-            })
+            }
 
-    # Capture attestation context for legal record (IP + timestamp + UA)
+    # Attestation
     client_ip = request.client.host if request.client else "unknown"
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
@@ -1195,14 +1696,221 @@ async def process_endpoint(
         "source": "url" if url else "file",
     }
 
-    job_id = str(uuid.uuid4())
+    # Job ID
+    if not job_id:
+        job_id = str(uuid.uuid4())
+
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
+
+    # Branding
+    if branding_payload:
+        try:
+            logo_data = branding_payload.get("logo", {}).pop("logo_image_data", None)
+            branding_cfg = BrandingConfig.model_validate(branding_payload)
+            if logo_data and logo_data.startswith("data:image"):
+                import base64 as b64mod
+                header, encoded = logo_data.split(",", 1)
+                logo_bytes = b64mod.b64decode(encoded)
+                logo_path = os.path.join(job_output_dir, "branding_logo.png")
+                with open(logo_path, "wb") as lf:
+                    lf.write(logo_bytes)
+                branding_cfg.logo.image_path = "branding_logo.png"
+                branding_cfg.logo.enabled = True
+            render_opts = RenderOptions(branding=branding_cfg)
+            save_options(job_output_dir, render_opts, {})
+        except Exception as e:
+            print(f"⚠️ Invalid render options ignored: {e}")
+
+    # Command setup
+    cmd = ["python", "-u", "main.py"]
+    env = os.environ.copy()
+    llm_env = await resolve_llm_env(request)
+    if not llm_env:
+        raise gemini_missing_error()
+    env.update(llm_env)
+
+    if url:
+        cmd.extend(["-u", url])
+    else:
+        cmd.extend(["-i", input_path])
+
+    cmd.extend(["-o", job_output_dir])
+    if output_format and output_format != "auto":
+        cmd.extend(["--format", output_format])
+    if reframe_mode in ("track", "general"):
+        cmd.extend(["--reframe-mode", reframe_mode])
+    if clip_duration_mode == "short":
+        cmd.extend(["--clip-duration", clip_duration_mode])
+
+    print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
+
+    # Metering
+    user_id, priority, reservation_id, user_plan = await reserve_process_minutes(request, url, input_path, job_id)
+    if user_plan == "free":
+        env["WATERMARK"] = "1"
+
+    # Job record
+    jobs[job_id] = {
+        'status': 'queued',
+        'logs': [f"Job {job_id} queued."],
+        'cmd': cmd,
+        'env': env,
+        'output_dir': job_output_dir,
+        'attestation': attestation,
+        'user_id': user_id,
+        'reservation_id': reservation_id,
+        'watermark': env.get("WATERMARK") == "1",
+        'autopilot_batch_id': autopilot_batch_id,
+    }
+
+    if user_id is not None:
+        try:
+            os.makedirs(job_output_dir, exist_ok=True)
+            with open(os.path.join(job_output_dir, ".owner"), "w") as f:
+                f.write(str(user_id))
+        except Exception as e:
+            print(f"⚠️ Could not persist job owner for {job_id}: {e}")
+
+    _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
+                           watermark=jobs[job_id]['watermark'])
+
+    _enqueue_job(job_id, priority)
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/api/process")
+async def process_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    url: Optional[str] = Form(None),
+    acknowledged: Optional[str] = Form(None),
+    output_format: Optional[str] = Form(None),
+    reframe_mode: Optional[str] = Form(None),
+    clip_duration_mode: Optional[str] = Form(None),
+    force_low_quality: Optional[str] = Form(None),
+    branding: Optional[str] = Form(None)
+):
+    source_type = "file" if file else "url"
+    print(f"📥 POST /api/process received: {source_type} upload")
+
+    ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
+    force_low = str(force_low_quality).lower() in ("1", "true", "yes")
+
+    # Handle JSON body manually for URL payload
+    content_type = request.headers.get("content-type", "")
+    branding_payload = None
+    if "application/json" in content_type:
+        body = await request.json()
+        url = body.get("url")
+        ack_flag = bool(body.get("acknowledged"))
+        force_low = bool(body.get("force_low_quality"))
+        output_format = body.get("output_format")
+        reframe_mode = body.get("reframe_mode")
+        clip_duration_mode = body.get("clip_duration_mode")
+        branding_payload = body.get("branding")
+    elif branding:
+        try:
+            branding_payload = json.loads(branding)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Normalize output format (auto = keep pipeline default).
+    if output_format not in ("vertical", "horizontal", "square"):
+        output_format = "auto"
+
+    # Normalize reframe mode (auto = per-scene detection).
+    if reframe_mode not in ("track", "general"):
+        reframe_mode = "auto"
+
+    # Normalize clip duration mode (auto = 15-60s viral range, short = 11-30s).
+    if clip_duration_mode != "short":
+        clip_duration_mode = "auto"
+
+    if not url and not file:
+        raise HTTPException(status_code=400, detail="Must provide URL or File")
+
+    # If it's a URL, go straight to job creation
+    if url:
+        return await _create_and_enqueue_job(
+            request=request,
+            input_path=None,
+            url=url,
+            ack_flag=ack_flag,
+            output_format=output_format,
+            branding_payload=branding_payload,
+            force_low=force_low,
+            reframe_mode=reframe_mode,
+            clip_duration_mode=clip_duration_mode
+        )
+
+    # For file uploads, save the file first
+    safe_name = os.path.basename(file.filename or "upload") or "upload"
+    job_id = str(uuid.uuid4())
+    input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{safe_name}")
+
+    # Read file in chunks to check size and save
+    size = 0
+    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    last_log_size = 0
+    log_interval = 50 * 1024 * 1024  # Log every 50MB
+
+    print(f"📥 Receiving upload: {safe_name} (job {job_id})")
+
+    with open(input_path, "wb") as buffer:
+        while content := await file.read(1024 * 1024):
+            size += len(content)
+            if size > limit_bytes:
+                os.remove(input_path)
+                raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+            buffer.write(content)
+
+            # Log progress every 50MB
+            if size - last_log_size >= log_interval:
+                print(f"   Uploaded {size / (1024*1024):.0f}MB...")
+                last_log_size = size
+
+    print(f"✅ Upload complete: {size / (1024*1024):.1f}MB")
+
+    # Now create the job
+    return await _create_and_enqueue_job(
+        request=request,
+        input_path=input_path,
+        url=None,
+        ack_flag=ack_flag,
+        output_format=output_format,
+        branding_payload=branding_payload,
+        force_low=force_low,
+        job_id=job_id,
+        reframe_mode=reframe_mode,
+        clip_duration_mode=clip_duration_mode
+    )
+
+    # Persist render options so main.py picks them up during clip rendering
+    if branding_payload:
+        try:
+            # Handle base64 logo image embedded in the payload
+            logo_data = branding_payload.get("logo", {}).pop("logo_image_data", None)
+            branding_cfg = BrandingConfig.model_validate(branding_payload)
+            if logo_data and logo_data.startswith("data:image"):
+                import base64 as b64mod
+                header, encoded = logo_data.split(",", 1)
+                logo_bytes = b64mod.b64decode(encoded)
+                logo_path = os.path.join(job_output_dir, "branding_logo.png")
+                with open(logo_path, "wb") as lf:
+                    lf.write(logo_bytes)
+                branding_cfg.logo.image_path = "branding_logo.png"
+                branding_cfg.logo.enabled = True
+            render_opts = RenderOptions(branding=branding_cfg)
+            save_options(job_output_dir, render_opts, {})
+        except Exception as e:
+            print(f"⚠️ Invalid render options ignored: {e}")
 
     # Prepare Command
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
+    env.update(llm_env)  # Inject provider config (gemini or openai_compat)
 
     input_path = None
     if url:
@@ -1217,6 +1925,10 @@ async def process_endpoint(
         # Read file in chunks to check size
         size = 0
         limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+        last_log_size = 0
+        log_interval = 50 * 1024 * 1024  # Log every 50MB
+
+        print(f"📥 Receiving upload: {safe_name} (job {job_id})")
 
         with open(input_path, "wb") as buffer:
             while content := await file.read(1024 * 1024): # Read 1MB chunks
@@ -1226,6 +1938,13 @@ async def process_endpoint(
                     shutil.rmtree(job_output_dir)
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                 buffer.write(content)
+
+                # Log progress every 50MB
+                if size - last_log_size >= log_interval:
+                    print(f"   Uploaded {size / (1024*1024):.0f}MB...")
+                    last_log_size = size
+
+        print(f"✅ Upload complete: {size / (1024*1024):.1f}MB")
 
         cmd.extend(["-i", input_path])
 
@@ -2078,7 +2797,16 @@ async def add_hook(req: HookRequest, request: Request):
         if not filename:
              base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
              filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
-         
+
+    # Re-applying a hook should REPLACE the previous one, not stack a second
+    # overlay. Walk back leading hook_ prefixes to the pre-hook file (only while
+    # that base still exists on disk), mirroring the subtitle walk-back.
+    while True:
+        m = re.match(r'^hook_(.+)$', filename)
+        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
+            break
+        filename = m.group(1)
+
     input_path = os.path.join(output_dir, filename)
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
@@ -2135,6 +2863,358 @@ async def add_hook(req: HookRequest, request: Request):
         "success": True,
         "new_video_url": f"/videos/{req.job_id}/{output_filename}"
     }
+
+
+# ---- Render Options endpoints ---------------------------------------------------
+
+class RenderOptionsUpdateRequest(BaseModel):
+    scope: str = "clip"  # "clip" | "all"
+    clip_index: Optional[int] = None
+    changes: dict = {}  # sparse override fields, e.g. {"branding": {"logo": {"position": "top_left"}}}
+
+
+@app.post("/api/jobs/{job_id}/render-options/logo")
+async def upload_render_logo(job_id: str, request: Request, file: UploadFile = File(...)):
+    """Upload a PNG logo for the job's render options."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not file.filename or not file.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        raise HTTPException(status_code=400, detail="Logo must be a PNG, JPG, or WebP image")
+
+    logo_filename = "branding_logo.png"
+    logo_path = os.path.join(output_dir, logo_filename)
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Logo file too large (max 10MB)")
+    with open(logo_path, "wb") as f:
+        f.write(content)
+
+    default, overrides = load_options(output_dir)
+    default.branding.logo.image_path = logo_filename
+    default.branding.logo.enabled = True
+    save_options(output_dir, default, overrides)
+
+    return {"success": True, "logo_path": f"/videos/{job_id}/{logo_filename}"}
+
+
+@app.get("/api/jobs/{job_id}/render-options")
+async def get_render_options(job_id: str, request: Request):
+    """Get the job's full render options and per-clip overrides."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    default, overrides = load_options(output_dir)
+    return {
+        "default": default.model_dump(),
+        "clip_overrides": overrides,
+    }
+
+
+@app.put("/api/jobs/{job_id}/render-options")
+async def update_render_options(job_id: str, body: RenderOptionsUpdateRequest, request: Request):
+    """Update render options.
+
+    scope="clip": sets a sparse override for clip_index, re-renders that clip.
+    scope="all": updates the job default, re-renders all non-overridden clips.
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    default, overrides = load_options(output_dir)
+
+    if body.scope == "clip":
+        if body.clip_index is None:
+            raise HTTPException(status_code=400, detail="clip_index required for scope=clip")
+        existing = overrides.get(str(body.clip_index), {})
+        deep_merge(existing, body.changes)
+        overrides[str(body.clip_index)] = existing
+        save_options(output_dir, default, overrides)
+
+        def _rebrand_one():
+            _rebrand_single_clip(output_dir, job_id, body.clip_index, default, overrides)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _rebrand_one)
+
+        new_filename = _clip_filename_for_index(output_dir, body.clip_index)
+        _update_clip_video_url(job, job_id, body.clip_index, new_filename)
+
+        return {"success": True, "scope": "clip", "clip_index": body.clip_index}
+
+    elif body.scope == "all":
+        base = default.model_dump()
+        deep_merge(base, body.changes)
+        default = RenderOptions.model_validate(base)
+        save_options(output_dir, default, overrides)
+
+        clips_to_rebrand = []
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        num_clips = 0
+        if json_files:
+            with open(json_files[0], "r") as f:
+                meta = json.load(f)
+            num_clips = len(meta.get("shorts", []))
+
+        for i in range(num_clips):
+            if str(i) not in overrides:
+                clips_to_rebrand.append(i)
+
+        def _rebrand_bulk():
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            workers = max(int(os.environ.get("CLIP_WORKERS", "3")), 1)
+            with ThreadPoolExecutor(max_workers=min(workers, max(1, len(clips_to_rebrand)))) as pool:
+                futures = {
+                    pool.submit(_rebrand_single_clip, output_dir, job_id, i, default, overrides): i
+                    for i in clips_to_rebrand
+                }
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"   ⚠️ Re-brand clip {futures[future]} failed: {e}")
+
+        if clips_to_rebrand:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _rebrand_bulk)
+
+        for i in clips_to_rebrand:
+            new_filename = _clip_filename_for_index(output_dir, i)
+            _update_clip_video_url(job, job_id, i, new_filename)
+
+        return {
+            "success": True,
+            "scope": "all",
+            "updated_clips": clips_to_rebrand,
+            "skipped_clips": [int(k) for k in overrides.keys()],
+        }
+
+    else:
+        raise HTTPException(status_code=400, detail="scope must be 'clip' or 'all'")
+
+
+@app.delete("/api/jobs/{job_id}/render-options/overrides/{clip_index}")
+async def delete_render_override(job_id: str, clip_index: int, request: Request):
+    """Remove a per-clip override; clip reverts to inheriting the job default."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    default, overrides = load_options(output_dir)
+
+    if str(clip_index) in overrides:
+        del overrides[str(clip_index)]
+        save_options(output_dir, default, overrides)
+
+        def _rebrand():
+            _rebrand_single_clip(output_dir, job_id, clip_index, default, overrides)
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _rebrand)
+
+        new_filename = _clip_filename_for_index(output_dir, clip_index)
+        _update_clip_video_url(job, job_id, clip_index, new_filename)
+
+    return {"success": True, "clip_index": clip_index}
+
+
+# ---- Legacy branding endpoints (aliases for backward compat) --------------------
+
+@app.post("/api/jobs/{job_id}/branding/logo")
+async def upload_branding_logo_legacy(job_id: str, request: Request, file: UploadFile = File(...)):
+    return await upload_render_logo(job_id, request, file)
+
+
+@app.get("/api/jobs/{job_id}/branding")
+async def get_branding_legacy(job_id: str, request: Request):
+    """Legacy: returns branding subset of render options."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    default, overrides = load_options(output_dir)
+    return {
+        "default": default.branding.model_dump(),
+        "clip_overrides": overrides,
+    }
+
+
+@app.put("/api/jobs/{job_id}/branding")
+async def update_branding_legacy(job_id: str, body: RenderOptionsUpdateRequest, request: Request):
+    """Legacy: wraps changes in branding namespace and delegates to render-options."""
+    # Wrap bare branding changes (e.g. {"logo": {...}}) into {"branding": {"logo": {...}}}
+    wrapped_changes = body.changes
+    if "logo" in wrapped_changes and "branding" not in wrapped_changes:
+        wrapped_changes = {"branding": wrapped_changes}
+    wrapped = RenderOptionsUpdateRequest(scope=body.scope, clip_index=body.clip_index, changes=wrapped_changes)
+    return await update_render_options(job_id, wrapped, request)
+
+
+@app.delete("/api/jobs/{job_id}/branding/overrides/{clip_index}")
+async def delete_branding_override_legacy(job_id: str, clip_index: int, request: Request):
+    return await delete_render_override(job_id, clip_index, request)
+
+
+# ---- Batch Processing Pipeline ---------------------------------------------------
+
+from batch import OPERATIONS as BATCH_OPERATIONS, run_batch, BatchProgress
+
+class BatchOperation(BaseModel):
+    type: str
+    config: dict = {}
+
+class BatchRequest(BaseModel):
+    operations: List[BatchOperation]
+    clip_indices: Optional[List[int]] = None  # None = all clips
+
+@app.post("/api/jobs/{job_id}/batch")
+async def start_batch(job_id: str, req: BatchRequest, request: Request):
+    """Start a generic batch processing pipeline over clips."""
+    await _ensure_job_files(job_id, request)
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+
+    if "result" not in job or "clips" not in job["result"]:
+        raise HTTPException(status_code=400, detail="Job has no clips")
+
+    # Reject if a batch is already running
+    existing = job.get("batch")
+    if existing and isinstance(existing, BatchProgress) and existing.status == "running":
+        raise HTTPException(status_code=409, detail="A batch is already running for this job")
+
+    # Validate operation types
+    for op in req.operations:
+        if op.type not in BATCH_OPERATIONS:
+            raise HTTPException(status_code=400, detail=f"Unknown operation type: {op.type}")
+
+    if not req.operations:
+        raise HTTPException(status_code=400, detail="No operations specified")
+
+    total_clips = len(job["result"]["clips"])
+    clip_indices = req.clip_indices if req.clip_indices is not None else list(range(total_clips))
+
+    # Validate indices
+    for idx in clip_indices:
+        if idx < 0 or idx >= total_clips:
+            raise HTTPException(status_code=400, detail=f"Clip index {idx} out of range (0-{total_clips-1})")
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    operations = [{"type": op.type, "config": op.config} for op in req.operations]
+
+    # Resolve API keys from headers for operations that need them
+    gemini_key = await resolve_gemini(request)
+    elevenlabs_key = request.headers.get("x-elevenlabs-key")
+
+    for op in operations:
+        if op["type"] == "auto_edit" and not op["config"].get("api_key"):
+            op["config"]["api_key"] = gemini_key
+        if op["type"] == "translate" and not op["config"].get("api_key"):
+            op["config"]["api_key"] = elevenlabs_key
+
+    # Launch background thread
+    t = threading.Thread(
+        target=run_batch,
+        args=(job_id, clip_indices, operations, output_dir, jobs, _archive_clip_edit_bg),
+        daemon=True,
+    )
+    t.start()
+
+    return {"success": True, "total_clips": len(clip_indices), "operations": [op["type"] for op in operations]}
+
+
+@app.get("/api/jobs/{job_id}/batch")
+async def get_batch_progress(job_id: str, request: Request):
+    """Get current batch processing progress."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[job_id])
+
+    batch = jobs[job_id].get("batch")
+    if not batch or not isinstance(batch, BatchProgress):
+        return {"status": "idle"}
+    return batch.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/batch/cancel")
+async def cancel_batch(job_id: str, request: Request):
+    """Cancel a running batch. In-flight clips finish their current step."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[job_id])
+
+    batch = jobs[job_id].get("batch")
+    if not batch or not isinstance(batch, BatchProgress):
+        raise HTTPException(status_code=404, detail="No batch running")
+    if batch.status != "running":
+        raise HTTPException(status_code=400, detail=f"Batch is not running (status: {batch.status})")
+
+    batch.cancel()
+    return {"success": True, "message": "Cancellation requested"}
+
+
+# ---- Shared helpers -------------------------------------------------------------
+
+def _clip_filename_for_index(output_dir: str, clip_index: int) -> str:
+    """Find the clip filename for a given index by looking at metadata."""
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if json_files:
+        with open(json_files[0], "r") as f:
+            meta = json.load(f)
+        base_name = os.path.basename(json_files[0]).replace("_metadata.json", "")
+        return f"{base_name}_clip_{clip_index + 1}.mp4"
+    return f"clip_{clip_index + 1}.mp4"
+
+
+def _rebrand_single_clip(output_dir: str, job_id: str, clip_index: int,
+                         default: RenderOptions, overrides: dict):
+    """Re-render branding for one clip from its pre-brand intermediate."""
+    clip_filename = _clip_filename_for_index(output_dir, clip_index)
+    clip_path = os.path.join(output_dir, clip_filename)
+    pre_brand_path = clip_path.replace(".mp4", "_pre_brand.mp4")
+
+    clip_override = overrides.get(str(clip_index))
+    effective = resolve_options(default, clip_override)
+
+    if not os.path.exists(pre_brand_path):
+        apply_branding(clip_path, effective.branding, output_dir)
+        return
+
+    rebrand_clip(pre_brand_path, clip_path, effective.branding, output_dir)
+
+
+def _update_clip_video_url(job: dict, job_id: str, clip_index: int, filename: str):
+    """Update in-memory job result and on-disk metadata with new video URL."""
+    new_url = f"/videos/{job_id}/{filename}"
+    if job.get("result") and clip_index < len(job["result"].get("clips", [])):
+        job["result"]["clips"][clip_index]["video_url"] = new_url
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if json_files:
+        try:
+            with open(json_files[0], "r") as f:
+                data = json.load(f)
+            clips = data.get("shorts", [])
+            if clip_index < len(clips):
+                clips[clip_index]["video_url"] = new_url
+                data["shorts"] = clips
+                with open(json_files[0], "w") as f:
+                    json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"⚠️ Failed to update metadata for render options: {e}")
+
 
 class TranslateRequest(BaseModel):
     job_id: str
@@ -2300,7 +3380,12 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
             "user": post_user,
             "title": final_title,
             "platform[]": req.platforms, # Pass list directly
-            "async_upload": "true"  # Enable async upload
+            "async_upload": "true",  # Enable async upload
+            # Every platform posts PUBLIC. TikTok's default is "moi
+            # uniquement" (private only-me), which leaves the clip stranded
+            # private and the provider stuck reporting "processing" — the
+            # platform never confirms a private post the same way.
+            "privacyStatus": "public"
         }
 
         # Add scheduling if present
@@ -2936,6 +4021,411 @@ async def thumbnail_publish_status(publish_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Autopilot: unattended multi-video clipping + auto-styling
+# ═══════════════════════════════════════════════════════════════════════
+# Additive subsystem (see autopilot.py). Fans N videos through the existing job
+# queue via _create_and_enqueue_job, flags each as an autopilot child, and lets
+# run_job auto-run the batch pipeline on each once its clips finalize. No
+# existing endpoint changes; the single-job flow is untouched.
+
+class AutopilotSource(BaseModel):
+    # Exactly one of url / file_ref identifies the video.
+    url: Optional[str] = None
+    file_ref: Optional[str] = None          # path returned by /api/autopilot/upload
+    label: Optional[str] = None             # display name for the board
+    override: Optional[dict] = None         # sparse per-video RenderOptions override
+    # Framing/length are job-creation params (CLI flags to main.py), NOT part of
+    # the RenderOptions recipe — so they can't ride the recipe cascade. They get
+    # their own 2-level fallback instead: None here means "inherit the batch
+    # value". A mixed batch (podcast + gameplay) needs these to differ per video.
+    reframe_mode: Optional[str] = None
+    clip_duration_mode: Optional[str] = None
+    # Per-video publish override. If set, this video publishes to these groups
+    # instead of the batch-level publish plan. Shape matches the batch publish plan.
+    publish: Optional[dict] = None
+
+
+class AutopilotCreateRequest(BaseModel):
+    recipe: dict                            # batch-level RenderOptions (model_dump shape)
+    sources: List[AutopilotSource]
+    output_format: str = "auto"
+    reframe_mode: str = "auto"              # batch default; per-source may override
+    clip_duration_mode: str = "auto"
+    ack: bool = False                       # content-ownership attestation (per source)
+    publish: Optional[dict] = None          # auto-publish plan (destination_ids, group_ids, platforms, clip_indexes, max_clips, schedule)
+
+
+def _norm_reframe_mode(value: Optional[str], fallback: str = "auto") -> str:
+    """Only 'track'/'general' steer the crop; anything else means auto-detect.
+    None means 'inherit the batch value' — an explicit 'auto' does NOT inherit."""
+    effective = fallback if value is None else value
+    return effective if effective in ("track", "general") else "auto"
+
+
+def _norm_clip_duration_mode(value: Optional[str], fallback: str = "auto") -> str:
+    """Only 'short' tightens the cut; anything else means auto length.
+    None means 'inherit the batch value' — an explicit 'auto' does NOT inherit."""
+    effective = fallback if value is None else value
+    return "short" if effective == "short" else "auto"
+
+
+def _autopilot_uploads_dir() -> str:
+    d = os.path.join(UPLOAD_DIR, "autopilot")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+@app.post("/api/autopilot/upload")
+async def autopilot_upload(
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    chunk: UploadFile = File(...),
+):
+    """Assemble-only chunked upload for autopilot sources.
+
+    Mirrors /api/upload/chunk's chunk handling but, unlike /api/upload/complete,
+    does NOT enqueue a job — it returns a server file ref once the last chunk
+    lands, which the caller passes to POST /api/autopilot. Kept separate so the
+    single-video upload path (lib/api.js -> complete_upload) is untouched.
+    """
+    if upload_id not in _chunked_uploads:
+        _chunked_uploads[upload_id] = {
+            "chunks": {},
+            "total_chunks": total_chunks,
+            "filename": chunk.filename,
+            "started_at": time.time(),
+            "autopilot": True,
+        }
+    info = _chunked_uploads[upload_id]
+    chunk_path = os.path.join(UPLOAD_DIR, f"chunk_{upload_id}_{chunk_index}")
+    with open(chunk_path, "wb") as f:
+        f.write(await chunk.read())
+    info["chunks"][chunk_index] = chunk_path
+
+    if len(info["chunks"]) != info["total_chunks"]:
+        return {"status": "received", "chunks_received": len(info["chunks"]),
+                "chunks_total": total_chunks}
+
+    # Last chunk — assemble into a stable ref (not yet a job).
+    filename = info["filename"] or f"{upload_id}.mp4"
+    ref_id = str(uuid.uuid4())
+    final_path = os.path.join(_autopilot_uploads_dir(), f"{ref_id}_{filename}")
+    try:
+        with open(final_path, "wb") as out_file:
+            for i in range(info["total_chunks"]):
+                cp = info["chunks"][i]
+                with open(cp, "rb") as cf:
+                    while content := cf.read(1024 * 1024):
+                        out_file.write(content)
+                os.remove(cp)
+        del _chunked_uploads[upload_id]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Assembly failed: {e}")
+
+    if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+        raise HTTPException(status_code=500, detail="Assembled file is empty")
+
+    return {"status": "assembled", "file_ref": final_path,
+            "filename": filename, "size": os.path.getsize(final_path)}
+
+
+def _resolve_autopilot_file_ref(file_ref: str) -> str:
+    """Validate a client-supplied file ref stays inside the autopilot uploads dir.
+
+    Prevents an arbitrary server path from being passed as an input; the ref must
+    be one this server handed back from /api/autopilot/upload.
+    """
+    base = os.path.abspath(_autopilot_uploads_dir())
+    candidate = os.path.abspath(file_ref)
+    if os.path.commonpath([base, candidate]) != base or not os.path.isfile(candidate):
+        raise HTTPException(status_code=400, detail="Invalid or unknown file reference")
+    return candidate
+
+
+@app.post("/api/autopilot")
+async def create_autopilot(req: AutopilotCreateRequest, request: Request):
+    """Create an autopilot batch: fan sources into child jobs, each pre-loaded
+    with its resolved (batch->video) recipe, flagged for auto-styling."""
+    if not req.sources:
+        raise HTTPException(status_code=400, detail="No sources provided")
+    if not req.ack:
+        raise HTTPException(status_code=400,
+                            detail="You must confirm you own the content or have rights to process it.")
+
+    # Validate the batch recipe up front (fail fast on a malformed recipe).
+    try:
+        batch_default = RenderOptions.model_validate(req.recipe or {})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid recipe: {e}")
+
+    # The branding logo arrives as a base64 data URL under
+    # branding.logo.logo_image_data (the same shape the single-video /api/process
+    # path sends). LogoOverlay has no such field, so model_validate above drops
+    # it — pull it from the raw payload here and write it into each child dir
+    # below, mirroring _create_and_enqueue_job's branding handling.
+    #
+    # Two levels carry an image: the batch recipe (shared by every child) and a
+    # per-video override (that one video only — e.g. a different client's logo in
+    # a mixed batch). The per-video image wins; each child has its own directory,
+    # so both land at the same filename without colliding.
+    def _logo_data_of(payload: Optional[dict]) -> Optional[str]:
+        try:
+            return (((payload or {}).get("branding") or {})
+                    .get("logo") or {}).get("logo_image_data")
+        except Exception:
+            return None
+
+    recipe_logo_data = _logo_data_of(req.recipe)
+
+    # Resolve keys ONCE and hold them in memory for the batch's lifetime — the
+    # auto-styling runs hours later with no request in scope. Gemini flows into
+    # each child job's env via _create_and_enqueue_job already; ElevenLabs has no
+    # such channel, so keep it on the batch record for the translate op.
+    gemini_key = await resolve_gemini(request)
+    elevenlabs_key = request.headers.get("x-elevenlabs-key")
+
+    owner = await _user_from_request(request)
+    user_id = str(owner.id) if owner else None
+
+    batch_id = str(uuid.uuid4())
+    autopilot_mod.register_batch(
+        batch_id, user_id, batch_default.model_dump(),
+        {"gemini": gemini_key, "elevenlabs": elevenlabs_key},
+        publish=req.publish,
+    )
+
+    created, errors = [], []
+    for idx, src in enumerate(req.sources):
+        if not src.url and not src.file_ref:
+            errors.append({"index": idx, "error": "source has neither url nor file_ref"})
+            continue
+        input_path = None
+        if src.file_ref:
+            input_path = _resolve_autopilot_file_ref(src.file_ref)
+
+        # A per-video override may carry its own logo image, which beats the
+        # batch one. Strip the data URL out of the override before it travels
+        # further: LogoOverlay has no such field (model_validate would drop it
+        # anyway) and a base64 image has no business sitting in the in-memory
+        # batch record for the hours this batch may run. src.override itself is
+        # never mutated — only this rebuilt copy.
+        override = src.override
+        source_logo_data = _logo_data_of(override)
+        if source_logo_data:
+            _branding = dict(override.get("branding") or {})
+            _branding["logo"] = {k: v for k, v in (_branding.get("logo") or {}).items()
+                                 if k != "logo_image_data"}
+            override = {**override, "branding": _branding}
+        logo_data = source_logo_data or recipe_logo_data
+
+        # Bake the batch->video cascade into this child's render_options.json so
+        # the existing (default->clip) hot path serves it unchanged downstream.
+        child_job_id = str(uuid.uuid4())
+        child_dir = os.path.join(OUTPUT_DIR, child_job_id)
+        os.makedirs(child_dir, exist_ok=True)
+        try:
+            resolved = resolve_cascade(batch_default, override)
+            # If a logo applies to this child and branding is enabled for it
+            # (post-cascade), decode it into the child dir so the branding
+            # processor — which self-loads render_options.json and reads
+            # logo.image_path from disk — actually finds it.
+            branding_on = bool(resolved.branding and resolved.branding.logo.enabled)
+            if (logo_data and isinstance(logo_data, str)
+                    and logo_data.startswith("data:image") and branding_on):
+                try:
+                    import base64 as _b64
+                    _, encoded = logo_data.split(",", 1)
+                    with open(os.path.join(child_dir, "branding_logo.png"), "wb") as lf:
+                        lf.write(_b64.b64decode(encoded))
+                    resolved.branding.logo.image_path = "branding_logo.png"
+                except Exception as e:
+                    print(f"⚠️ Autopilot branding logo write failed for {child_job_id}: {e}")
+            if branding_on and not resolved.branding.logo.image_path:
+                # Branding switched on with no image at either level. apply_branding
+                # bails on a missing image_path, so the op would burn a pass and
+                # silently emit an unbranded clip. Turn it off instead of lying.
+                print(f"⚠️ Autopilot: branding enabled for {child_job_id} with no logo "
+                      f"image at batch or video level; skipping branding for it.")
+                resolved.branding.logo.enabled = False
+            save_options(child_dir, resolved, {})
+        except Exception as e:
+            errors.append({"index": idx, "error": f"recipe resolve failed: {e}"})
+            continue
+
+        try:
+            result = await _create_and_enqueue_job(
+                request,
+                input_path=input_path,
+                url=src.url,
+                ack_flag=True,
+                output_format=req.output_format,
+                branding_payload=None,           # recipe already saved above
+                force_low=True,                  # skip the interactive URL quality gate
+                job_id=child_job_id,
+                reframe_mode=_norm_reframe_mode(src.reframe_mode, req.reframe_mode),
+                clip_duration_mode=_norm_clip_duration_mode(
+                    src.clip_duration_mode, req.clip_duration_mode),
+                autopilot_batch_id=batch_id,
+            )
+        except HTTPException as he:
+            errors.append({"index": idx, "error": he.detail})
+            continue
+        except Exception as e:
+            errors.append({"index": idx, "error": str(e)})
+            continue
+
+        label = src.label or (src.url or os.path.basename(input_path or f"video {idx+1}"))
+        kind = "url" if src.url else "file"
+        # `override`, not src.override — the logo data URL is already on disk.
+        autopilot_mod.attach_child(batch_id, child_job_id, label, kind, override)
+        # Store per-video publish override if provided
+        if src.publish:
+            autopilot_mod.set_publish_override(batch_id, child_job_id, src.publish)
+        created.append(result.get("job_id", child_job_id))
+
+    if not created:
+        # Nothing enqueued — surface the batch as failed rather than an empty run.
+        autopilot_mod.cancel_batch(batch_id)
+        raise HTTPException(status_code=400,
+                            detail={"message": "No jobs could be created", "errors": errors})
+
+    return {"batch_id": batch_id, "created": created, "errors": errors,
+            "total": len(created)}
+
+
+@app.get("/api/autopilot")
+async def list_autopilot(request: Request):
+    """List the caller's autopilot batches (board rehydrate on reload)."""
+    owner = await _user_from_request(request)
+    user_id = str(owner.id) if owner else None
+    return {"batches": autopilot_mod.list_batches(user_id, jobs)}
+
+
+@app.get("/api/autopilot/{batch_id}")
+async def get_autopilot(batch_id: str, request: Request):
+    """Aggregate per-video progress across a batch's child jobs."""
+    rec = autopilot_mod.autopilot_batches.get(batch_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Autopilot batch not found")
+    await _assert_job_owner(request, {"user_id": rec.get("user_id")})
+    prog = autopilot_mod.progress(batch_id, jobs)
+    if prog is None:
+        raise HTTPException(status_code=404, detail="Autopilot batch not found")
+    return prog
+
+
+@app.post("/api/autopilot/{batch_id}/cancel")
+async def cancel_autopilot(batch_id: str, request: Request):
+    """Cancel a batch: flag it (blocks not-yet-fired auto-styling) and cancel any
+    in-flight per-clip batches on its children. Queued child jobs still run to
+    completion but skip auto-styling once they finish."""
+    rec = autopilot_mod.autopilot_batches.get(batch_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Autopilot batch not found")
+    await _assert_job_owner(request, {"user_id": rec.get("user_id")})
+
+    autopilot_mod.cancel_batch(batch_id)
+    cancelled_batches = 0
+    for child_id in list(rec.get("child_job_ids", [])):
+        batch = (jobs.get(child_id) or {}).get("batch")
+        if batch is not None and getattr(batch, "status", None) == "running":
+            try:
+                batch.cancel()
+                cancelled_batches += 1
+            except Exception:
+                pass
+    return {"success": True, "cancelled_active_batches": cancelled_batches}
+
+
+class AutopilotManualPublishRequest(BaseModel):
+    """Manually trigger auto-publish for a completed job within an autopilot batch."""
+    job_id: str
+    group_ids: List[str] = []
+    platforms: List[str] = []
+    max_clips: Optional[int] = None
+    schedule: Optional[str] = None  # 'immediate' | 'spread'
+
+
+@app.post("/api/autopilot/{batch_id}/publish")
+async def autopilot_manual_publish(
+    batch_id: str,
+    req: AutopilotManualPublishRequest,
+    request: Request,
+):
+    """Manually trigger auto-publish for a completed job within an autopilot batch.
+
+    Used when a user didn't enable auto-publish at setup time, but wants to publish
+    after reviewing the generated clips. Requires the job to be in 'done' stage.
+    """
+    if not PUBLISHING_ENABLED:
+        raise HTTPException(status_code=400, detail="Publishing is not enabled on this server")
+
+    rec = autopilot_mod.autopilot_batches.get(batch_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Autopilot batch not found")
+
+    await _assert_job_owner(request, {"user_id": rec.get("user_id")})
+
+    # Verify the job belongs to this batch
+    if req.job_id not in rec.get("child_job_ids", []):
+        raise HTTPException(status_code=400, detail="Job does not belong to this autopilot batch")
+
+    job = jobs.get(req.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Check job is done and has clips
+    result = job.get("result") or {}
+    clips = result.get("clips") or []
+    if not clips:
+        raise HTTPException(status_code=400, detail="Job has no clips to publish")
+
+    # Build publish plan from request
+    plan = {
+        "destination_ids": [],
+        "group_ids": req.group_ids,
+        "platforms": req.platforms,
+        "clip_indexes": None,
+        "max_clips": req.max_clips,
+        "schedule": req.schedule or "immediate",
+    }
+
+    # Validate at least one destination is specified
+    if not plan["group_ids"] and not plan["destination_ids"]:
+        raise HTTPException(status_code=400, detail="Specify at least one group or destination")
+
+    user_id = job.get("user_id")
+
+    async def _do_publish():
+        try:
+            from publishing import autopublish
+            report = await autopublish.publish_job_clips(
+                req.job_id, len(clips), plan, user_id=user_id, actor="manual"
+            )
+            n = len(report.get('created') or [])
+            skipped = len(report.get('skipped') or [])
+            job.setdefault('logs', []).append(
+                f"Manual publish: {n} post(s) created"
+                + (f", {skipped} clip(s) skipped." if skipped else "."))
+            return report
+        except Exception as e:
+            print(f"⚠️  Manual publish failed for {req.job_id}: {e}")
+            job.setdefault('logs', []).append(f"Manual publish failed: {e}")
+            raise
+
+    # Run async and return immediately
+    loop = asyncio.get_event_loop()
+    asyncio.run_coroutine_threadsafe(_do_publish(), loop)
+
+    return {
+        "success": True,
+        "message": f"Publishing job {req.job_id} scheduled",
+        "clip_count": len(clips),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # SaaSShorts: AI UGC Video Generator for SaaS Products
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -3176,6 +4666,10 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
             "title": final_title,
             "platform[]": req.platforms,
             "async_upload": "true",
+            # Every platform posts PUBLIC. Without this, TikTok falls back to
+            # its "moi uniquement" (private) default and never surfaces as a
+            # confirmed public post.
+            "privacyStatus": "public",
         }
 
         if req.scheduled_date:

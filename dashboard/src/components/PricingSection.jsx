@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Check, Loader2, Zap, Github, Server } from 'lucide-react';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/auth-context';
 import { apiJson } from '../lib/api';
 import { track } from '../lib/analytics';
 import SegmentedControl from './ui/SegmentedControl';

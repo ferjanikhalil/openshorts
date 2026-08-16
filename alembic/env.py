@@ -14,6 +14,9 @@ from alembic import context
 # Register model metadata.
 from cloud.database import Base
 import cloud.models  # noqa: F401
+# Publishing shares the same declarative Base, so its nine tables must be
+# registered here too or autogenerate would read them as "dropped".
+import publishing.models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

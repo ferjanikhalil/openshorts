@@ -21,7 +21,7 @@ const SIZE_SCALE: Record<string, number> = {
 };
 
 const POSITION_STYLE: Record<string, React.CSSProperties> = {
-  top: { top: "18%", bottom: "auto" },
+  top: { top: "12%", bottom: "auto" },
   center: { top: "50%", bottom: "auto", transform: "translateY(-50%)" },
   bottom: { top: "68%", bottom: "auto" },
 };

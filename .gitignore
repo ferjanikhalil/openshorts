@@ -43,3 +43,9 @@ skills-lock.json
 
 # Cloud env example kept local only (avoid leaking infra hints)
 .env.cloud.example
+
+# Local debug/log artifacts
+docker-logs-*.csv
+system logs*.txt
+diagnos fix.txt
+wslconfig.txt

@@ -352,8 +352,8 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
              # Bottom 20% mark (approx)
              overlay_y = int(video_height * 0.70)
         else:
-             # Top 20% mark
-             overlay_y = int(video_height * 0.20)
+             # Top 12% mark (higher placement for better visibility)
+             overlay_y = int(video_height * 0.12)
         
         # 4. FFmpeg Command
         print(f"🎬 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")

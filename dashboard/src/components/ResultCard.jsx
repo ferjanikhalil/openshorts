@@ -1,14 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2 } from 'lucide-react';
+import { Download, Share2, Instagram, Youtube, Video, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Image } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
+import BrandingEditor from './BrandingEditor';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
-import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
-import { useAuth } from '../contexts/AuthContext';
+import WatermarkModal from './WatermarkModal';
+import { watermarkNoticeDismissed } from '../lib/watermark';
+import { useAuth } from '../contexts/auth-context';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
 const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
@@ -124,6 +126,7 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
     const [isTranslating, setIsTranslating] = useState(false);
     const [showHookModal, setShowHookModal] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
+    const [showBrandingModal, setShowBrandingModal] = useState(false);
     const [editError, setEditError] = useState(null);
 
     const [clipDuration, setClipDuration] = useState(clip.end && clip.start ? clip.end - clip.start : 30);
@@ -166,6 +169,12 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         ? PLATFORM_OPTIONS.map((o) => (connectedPlatforms.includes(o.value) ? o : { ...o, disabled: true, hint: 'not connected' }))
         : PLATFORM_OPTIONS;
 
+    // Mirror the latest connection list into a ref so the "reset on open" effect
+    // can read current values without re-firing (and wiping the form) when the
+    // prop changes mid-edit.
+    const connectedPlatformsRef = React.useRef(connectedPlatforms);
+    connectedPlatformsRef.current = connectedPlatforms;
+
     const handleConnectAccounts = () => {
         setShowModal(false);
         if (onConnectSocials) onConnectSocials();
@@ -181,11 +190,13 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
             setScheduleDate("");
             setPostResult(null);
             // Only preselect platforms the profile can actually publish to.
-            if (knownConnections) {
+            // Read via ref so changes to the prop don't reset the form mid-edit.
+            const connected = connectedPlatformsRef.current;
+            if (Array.isArray(connected)) {
                 setPlatforms({
-                    tiktok: connectedPlatforms.includes('tiktok'),
-                    instagram: connectedPlatforms.includes('instagram'),
-                    youtube: connectedPlatforms.includes('youtube'),
+                    tiktok: connected.includes('tiktok'),
+                    instagram: connected.includes('instagram'),
+                    youtube: connected.includes('youtube'),
                 });
             }
         }
@@ -694,6 +705,14 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                     </button>
 
                     <button
+                        onClick={() => setShowBrandingModal(true)}
+                        className={QUIET_BTN}
+                    >
+                        <Image size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        branding
+                    </button>
+
+                    <button
                         onClick={() => setShowTranslateModal(true)}
                         disabled={isTranslating}
                         className={QUIET_BTN}
@@ -917,6 +936,16 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                 isProcessing={isTranslating}
                 videoUrl={currentVideoUrl}
                 hasApiKey={!!elevenLabsKey}
+            />
+
+            <BrandingEditor
+                isOpen={showBrandingModal}
+                onClose={() => setShowBrandingModal(false)}
+                jobId={jobId}
+                clipIndex={index}
+                onApplied={() => {
+                    if (videoRef.current) videoRef.current.load();
+                }}
             />
 
             {showWatermarkModal && (

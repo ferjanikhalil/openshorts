@@ -1,7 +1,7 @@
 import React from 'react';
 import { Sparkles, Zap, Globe, FileVideo, Subtitles, Youtube, Instagram, Shield, Github, ArrowRight, Check, ChevronDown, Monitor, Cpu, Languages, Type, Upload, Scissors, Link2 } from 'lucide-react';
 import PricingSection from './components/PricingSection';
-import { useAuth } from './contexts/AuthContext';
+import { useAuth } from './contexts/auth-context';
 import './landing.css';
 
 // 64 deterministic tick heights: gaussian envelope × sine wave (no randomness)

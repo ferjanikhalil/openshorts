@@ -1,7 +1,9 @@
 import time
+import math
 import cv2
 import scenedetect
 import subprocess
+import shutil
 import argparse
 import re
 import sys
@@ -17,12 +19,17 @@ from tqdm import tqdm
 import yt_dlp
 import mediapipe as mp
 # import whisper (replaced by faster_whisper inside function)
-from google import genai
-from google.genai import types as genai_types
-
 import gemini_worker
+from llm import create_provider
+from llm.base import LLMConfig
+from llm.mission import (
+    execute_mission, write_manifest,
+    load_completed_mission, save_mission_result,
+    load_transcript, save_transcript,
+)
 from clip_selection import build_transcript_windows, snap_clip_to_words
 from ffmpeg_utils import video_encode_args, QUALITY, QUALITY_FAST
+from render_options import load_options, resolve_options, apply_branding
 from dotenv import load_dotenv
 import json
 
@@ -419,11 +426,33 @@ def create_general_frame(frame, output_width, output_height):
     
     return final_frame
 
-def analyze_scenes_strategy(video_path, scenes):
+def reframe_mode_to_strategy(reframe_mode):
+    """Map a user-facing reframe_mode to a forced per-scene strategy.
+
+    'general' -> always full-width blurred layout (gaming, screen share, wide
+    shots), 'track' -> always follow the subject, 'auto'/None -> let
+    analyze_scenes_strategy decide per scene (returns None = no override).
+    """
+    mode = (reframe_mode or "auto").strip().lower()
+    if mode == "general":
+        return "GENERAL"
+    if mode == "track":
+        return "TRACK"
+    return None
+
+
+def analyze_scenes_strategy(video_path, scenes, force_strategy=None):
     """
     Analyzes each scene to determine if it should be TRACK (Single person) or GENERAL (Group/Wide).
     Returns list of strategies corresponding to scenes.
+
+    force_strategy: when 'TRACK' or 'GENERAL', skip face detection and apply
+    that strategy to every scene (user override for e.g. gaming clips where the
+    streamer's facecam would otherwise pull the crop onto their face).
     """
+    if force_strategy in ("TRACK", "GENERAL"):
+        return [force_strategy] * len(scenes)
+
     cap = cv2.VideoCapture(video_path)
     strategies = []
 
@@ -678,13 +707,14 @@ def finalize_clip_passthrough(input_video, final_output_video):
     return True
 
 
-def render_clip(input_video, final_output_video, output_format="auto"):
+def render_clip(input_video, final_output_video, output_format="auto", reframe_mode="auto"):
     """Route a cut clip through the right renderer for the chosen output format.
     vertical/auto -> 9:16 reframe, square -> 1:1 reframe, horizontal -> keep."""
     if output_format == "horizontal":
         return finalize_clip_passthrough(input_video, final_output_video)
     aspect = 1.0 if output_format == "square" else ASPECT_RATIO
-    return process_video_to_vertical(input_video, final_output_video, aspect_ratio=aspect)
+    return process_video_to_vertical(input_video, final_output_video, aspect_ratio=aspect,
+                                     reframe_mode=reframe_mode)
 
 
 # Watermark geometry, as fractions of the clip width/height.
@@ -752,13 +782,17 @@ def apply_watermark(video_path):
     return False
 
 
-def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPECT_RATIO):
+def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPECT_RATIO,
+                              reframe_mode="auto"):
     """
     Core logic to reframe a horizontal video to a target aspect ratio using
     scene detection and Active Speaker Tracking (MediaPipe).
     aspect_ratio: width/height of the output (9/16 vertical, 1.0 square).
+    reframe_mode: 'auto' (per-scene detection), 'track' (always follow subject),
+    or 'general' (always full-width blurred layout — gaming/screen share).
     """
     script_start_time = time.time()
+    force_strategy = reframe_mode_to_strategy(reframe_mode)
 
     # v2 engine: analyze downscaled, render natively in ffmpeg. Any failure
     # falls back to the v1 frame loop below so a v2 edge case can't kill jobs.
@@ -766,7 +800,8 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
         try:
             import reframe_v2
             t0 = time.time()
-            result = reframe_v2.render(input_video, final_output_video, aspect_ratio)
+            result = reframe_v2.render(input_video, final_output_video, aspect_ratio,
+                                       reframe_mode=reframe_mode)
             print(f"   ⏱️ Reframe v2 total: {time.time() - t0:.1f}s")
             return result
         except Exception as e:
@@ -817,7 +852,7 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     
     # --- New Strategy: Per-Scene Analysis ---
     print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
-    scene_strategies = analyze_scenes_strategy(input_video, scenes)
+    scene_strategies = analyze_scenes_strategy(input_video, scenes, force_strategy=force_strategy)
     # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
     
     print("\n   ✂️ Step 4: Processing video frames...")
@@ -939,12 +974,13 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     if os.path.exists(temp_audio_output):
         merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output, '-i', temp_audio_output,
-            '-c:v', 'copy', '-c:a', 'copy', final_output_video
+            '-c:v', 'copy', '-c:a', 'copy', '-movflags', '+faststart',
+            final_output_video
         ]
     else:
          merge_command = [
             'ffmpeg', '-y', '-i', temp_video_output,
-            '-c:v', 'copy', final_output_video
+            '-c:v', 'copy', '-movflags', '+faststart', final_output_video
         ]
         
     try:
@@ -961,7 +997,17 @@ def process_video_to_vertical(input_video, final_output_video, aspect_ratio=ASPE
     
     return True
 
-def transcribe_video(video_path):
+def transcribe_video(video_path, output_dir=None):
+    # Resume: reuse a cached transcript from a prior (interrupted) run so we
+    # never re-transcribe the same input. The cache is keyed by output_dir,
+    # which is unique per job.
+    if output_dir:
+        cached = load_transcript(output_dir)
+        if cached and cached.get('segments'):
+            print(f"⏭️  Transcript: loaded from checkpoint "
+                  f"({len(cached['segments'])} segments)")
+            return cached
+
     print("🎙️  Transcribing video...")
     from transcribe_backends import transcribe_media
 
@@ -973,59 +1019,89 @@ def transcribe_video(video_path):
         # Print progress to keep user informed (and prevent timeouts feeling)
         print(f"   [{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}")
 
+    if output_dir:
+        save_transcript(output_dir, transcript)
+
     return transcript
 
-def _run_gemini_stage(client, model_name, prompt, schema):
-    """One schema-enforced Gemini call with transient-error backoff.
+_TRANSPORT_ERRORS = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
+
+_TRANSPORT_MSG_TOKENS = (
+    'connection reset', 'connection refused', 'connection aborted',
+    'name or service not known', 'nodename nor servname',
+    'getaddrinfo failed', 'dns',
+    'ssl', 'tls', 'certificate verify failed',
+    'socket timeout', 'timed out',
+    'network is unreachable', 'host is unreachable',
+    'broken pipe', 'eof occurred',
+)
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    if isinstance(exc, _TRANSPORT_ERRORS):
+        return True
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _TRANSPORT_MSG_TOKENS)
+
+
+def _run_llm_stage(provider, prompt, schema):
+    """One schema-enforced LLM call with a single transport-level retry.
+
+    Provider-level failures (HTTP 429/500/503, quota, malformed output)
+    propagate immediately — those are OmniRoute's responsibility.
     Returns (parsed_dict, cost_analysis)."""
-    config = genai_types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=schema,
-    )
-    max_attempts = 3
-    response = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = client.models.generate_content(model=model_name, contents=prompt, config=config)
-            break
-        except Exception as e:
-            msg = str(e)
-            transient = any(tok in msg for tok in (
-                '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-                '500', 'INTERNAL', 'overloaded', 'Deadline'))
-            if attempt == max_attempts or not transient:
-                raise
-            wait = 5 * (2 ** (attempt - 1))
-            print(f"⚠️ Gemini transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
-            time.sleep(wait)
+    config = LLMConfig(temperature=0.2, response_schema=schema)
+    try:
+        llm_response = provider.generate(prompt, config)
+    except Exception as e:
+        if not _is_transport_error(e):
+            raise
+        print(f"\u26a0\ufe0f Transport error, retrying once in 3s: {str(e)[:150]}")
+        time.sleep(3)
+        llm_response = provider.generate(prompt, config)
 
-    parsed_obj = getattr(response, "parsed", None)
-    if parsed_obj is not None:
-        parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
-    else:
-        parsed = gemini_worker._parse_json_response_text(gemini_worker._get_response_text(response))
-    cost = gemini_worker._calculate_cost_analysis(response, model_name)
-    return parsed, cost
+    model_name = llm_response.model or "unknown"
+    cost = gemini_worker._calculate_cost_analysis(llm_response, model_name)
+    return llm_response.parsed, cost
 
 
-def get_viral_clips(transcript_result, video_duration):
+def get_viral_clips(transcript_result, video_duration, output_dir=None,
+                    clip_duration_mode="auto"):
     """Two-pass clip selection: score transcript windows, then detail the best.
 
     Windowing gives even coverage on long videos (a single call over the whole
     transcript clusters picks near the start), and the cheap scoring pass keeps
     the expensive detail reasoning focused on the shortlist. Cuts are snapped to
     word boundaries so clips don't start/end mid-word.
+
+    clip_duration_mode: "auto" (15-60s viral length) or "short" (tightest clip
+    that still holds the full hook->payoff, floored at 11s, capped at 30s).
     """
-    print("\U0001f916  Analyzing with Gemini (2-pass: score → detail)...")
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
+    print("\U0001f916  Analyzing with LLM (2-pass: score \u2192 detail)...")
+    try:
+        provider = create_provider()
+    except (ValueError, Exception) as e:
+        print(f"\u274c Error: Could not initialize LLM provider: {e}")
         return None
 
-    client = genai.Client(api_key=api_key)
-    model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
     language = str(transcript_result.get('language') or 'unknown')
-    print(f"\U0001f916  Model: {model_name} | language: {language}")
+    print(f"\U0001f916  Provider: {provider.provider_name()} | language: {language}")
+
+    # Clip-length policy: "short" produces the tightest understandable clip
+    # (11-30s), "auto" keeps the 15-60s viral range. Drives both the LLM prompt
+    # and the word-boundary snapping bounds so they stay consistent.
+    if clip_duration_mode == "short":
+        duration_directive = gemini_worker.DURATION_DIRECTIVE_SHORT
+        snap_min, snap_max = 11.0, 30.0
+    else:
+        duration_directive = gemini_worker.DURATION_DIRECTIVE_AUTO
+        snap_min, snap_max = 15.0, 60.0
+    print(f"\U0001f4cf  Clip duration mode: {clip_duration_mode} "
+          f"({snap_min:.0f}-{snap_max:.0f}s)")
 
     # Full word list — ground truth for snapping cut points.
     words = []
@@ -1038,16 +1114,30 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"   Built {len(windows)} scoring window(s).")
         costs = []
 
-        # --- Pass 1: score windows in batches, keep the highest-scoring ---
-        scored = []
+        # --- Pass 1: score windows in batches (checkpointed) ---
         SCORE_BATCH = 8
-        for b in range(0, len(windows), SCORE_BATCH):
+        num_batches = math.ceil(len(windows) / SCORE_BATCH)
+        mission_ids = [f"score_batch_{i:03d}" for i in range(num_batches)] + ["detail"]
+        if output_dir:
+            write_manifest(output_dir, mission_ids, "scoring")
+
+        scored = []
+        for b_idx, b in enumerate(range(0, len(windows), SCORE_BATCH)):
             batch = windows[b:b + SCORE_BATCH]
+            mission_id = f"score_batch_{b_idx:03d}"
             payload = [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in batch]
             prompt = gemini_worker.SCORE_PROMPT_TEMPLATE.format(
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(payload, ensure_ascii=False))
-            parsed, cost = _run_gemini_stage(client, model_name, prompt, gemini_worker.ScoreResponse)
+
+            def _do_score(p=prompt):
+                return _run_llm_stage(provider, p, gemini_worker.ScoreResponse)
+
+            if output_dir:
+                parsed, cost = execute_mission(output_dir, mission_id, _do_score)
+            else:
+                parsed, cost = _do_score()
+
             if cost:
                 costs.append(cost)
             scored.extend(parsed.get("windows") or [])
@@ -1062,19 +1152,29 @@ def get_viral_clips(transcript_result, video_duration):
             shortlist = windows[:target]  # scoring returned nothing usable
         print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
 
-        # --- Pass 2: detailed clip extraction on the shortlist ---
+        # --- Pass 2: detailed clip extraction on the shortlist (checkpointed) ---
         payload = [{"id": w["id"], "start": w["start"], "end": w["end"], "text": w["text"]} for w in shortlist]
         prompt = gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
             video_duration=video_duration, language=language,
+            duration_directive=duration_directive,
             windows_json=json.dumps(payload, ensure_ascii=False))
-        detail, cost = _run_gemini_stage(client, model_name, prompt, gemini_worker.DetailResponse)
+
+        def _do_detail(p=prompt):
+            return _run_llm_stage(provider, p, gemini_worker.DetailResponse)
+
+        if output_dir:
+            detail, cost = execute_mission(output_dir, "detail", _do_detail)
+        else:
+            detail, cost = _do_detail()
+
         if cost:
             costs.append(cost)
 
         shorts = detail.get("shorts") or []
         # Snap each proposed clip onto real word boundaries (+ a bit of silence).
         for s in shorts:
-            ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration)
+            ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
+                                        min_duration=snap_min, max_duration=snap_max)
             s["start"], s["end"] = ns, ne
 
         # Aggregate cost across both passes.
@@ -1084,12 +1184,12 @@ def get_viral_clips(transcript_result, video_duration):
                 "input_tokens": sum(c.get("input_tokens", 0) for c in costs),
                 "output_tokens": sum(c.get("output_tokens", 0) for c in costs),
                 "total_cost": sum(c.get("total_cost", 0) for c in costs),
-                "model": model_name,
+                "model": provider.provider_name(),
             }
-            print(f"\U0001f4b0 Total cost ({model_name}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
+            print(f"\U0001f4b0 Total cost ({cost_analysis['model']}, 2-pass, {len(costs)} calls): ${cost_analysis['total_cost']:.6f}")
 
         if not shorts:
-            print("⚠️ 2-pass returned no clips.")
+            print("\u26a0\ufe0f 2-pass returned no clips.")
             return None
 
         result = {"shorts": shorts}
@@ -1097,7 +1197,7 @@ def get_viral_clips(transcript_result, video_duration):
             result["cost_analysis"] = cost_analysis
         return result
     except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+        print(f"\u274c LLM Error: {e}")
         return None
 
 
@@ -1113,9 +1213,18 @@ if __name__ == '__main__':
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
     parser.add_argument('--format', type=str, default="auto", choices=["auto", "vertical", "horizontal", "square"],
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
+    parser.add_argument('--reframe-mode', type=str, default="auto", choices=["auto", "track", "general"],
+                        help="Reframe layout: auto (per-scene detection), track (always follow the "
+                             "subject's face), general (always full-width blurred layout — best for "
+                             "gaming/screen-share where a facecam would otherwise hijack the crop).")
+    parser.add_argument('--clip-duration', type=str, default="auto", choices=["auto", "short"],
+                        help="Clip length policy: auto (15-60s viral range), short (tightest "
+                             "understandable clip, 11-30s).")
 
     args = parser.parse_args()
     output_format = args.format
+    reframe_mode = args.reframe_mode
+    clip_duration_mode = args.clip_duration
 
     script_start_time = time.time()
     
@@ -1165,10 +1274,10 @@ if __name__ == '__main__':
     if args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
         output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
-        render_clip(input_video, output_file, output_format)
+        render_clip(input_video, output_file, output_format, reframe_mode)
     else:
-        # 3. Transcribe
-        transcript = transcribe_video(input_video)
+        # 3. Transcribe (checkpointed: cached under output_dir for resume)
+        transcript = transcribe_video(input_video, output_dir=output_dir)
         
         # Get duration
         cap = cv2.VideoCapture(input_video)
@@ -1178,12 +1287,41 @@ if __name__ == '__main__':
         cap.release()
 
         # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
+        clips_data = get_viral_clips(transcript, duration, output_dir=output_dir,
+                                     clip_duration_mode=clip_duration_mode)
         
         if not clips_data or 'shorts' not in clips_data:
             print("❌ Failed to identify clips. Converting whole video as fallback.")
-            output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
-            render_clip(input_video, output_file, output_format)
+            # Use the _clip_1 name and write metadata, because that pair is the
+            # only contract app.py recognizes: it globs *_metadata.json and looks
+            # for {base}_clip_{i+1}.mp4. Writing {title}_vertical.mp4 with no
+            # metadata made the job report "No metadata file generated" and fail,
+            # silently discarding this render.
+            output_file = os.path.join(output_dir, f"{video_title}_clip_1.mp4")
+            render_clip(input_video, output_file, output_format, reframe_mode)
+
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                fallback_meta = {
+                    'shorts': [{
+                        'start': 0.0,
+                        'end': float(duration),
+                        'source_window_id': 'fallback_full_video',
+                        'predicted_score': 0,
+                        'video_title_for_youtube_short': video_title[:100],
+                        'video_description_for_tiktok': '',
+                        'video_description_for_instagram': '',
+                        'viral_hook_text': '',
+                        # Flags this as the un-analyzed whole video, not a pick.
+                        'is_fallback': True,
+                    }],
+                    'transcript': transcript,
+                }
+                metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+                with open(metadata_file, 'w') as f:
+                    json.dump(fallback_meta, f, indent=2)
+                print(f"   Saved fallback metadata to {metadata_file}")
+            else:
+                print("❌ Fallback conversion produced no file.")
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
             
@@ -1197,6 +1335,9 @@ if __name__ == '__main__':
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
             # detector inference is serialized internally via DETECT_LOCK.
+            # Load render options once for the whole job
+            render_defaults, render_overrides = load_options(output_dir)
+
             def _process_one_clip(i, clip):
                 start = clip['start']
                 end = clip['end']
@@ -1206,9 +1347,22 @@ if __name__ == '__main__':
                 clip_filename = f"{video_title}_clip_{i+1}.mp4"
                 clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
                 clip_final_path = os.path.join(output_dir, clip_filename)
+                clip_pre_brand_path = os.path.join(output_dir, f"{video_title}_clip_{i+1}_pre_brand.mp4")
+                clip_mission_id = f"clip_{i:03d}"
+
+                # Resume: a fully-rendered clip from a prior (interrupted) run is
+                # checkpointed once branding + watermark are applied. Skip it only
+                # when BOTH the checkpoint and its output file survive on disk.
+                if load_completed_mission(output_dir, clip_mission_id) and os.path.exists(clip_final_path):
+                    print(f"   ⏭️  Clip {i+1}: loaded from checkpoint (skip re-render)")
+                    return True
 
                 try:
-                    # ffmpeg cut — re-encoding for precision on strict seconds
+                    # ffmpeg cut — re-encoding for precision on strict seconds.
+                    # check=True is not enough: ffmpeg can exit 0 yet write no
+                    # file (e.g. seek past EOF), so verify the output exists.
+                    # Surface the real stderr instead of swallowing it, so the
+                    # downstream "Video file not found" never masks the cause.
                     cut_command = [
                         'ffmpeg', '-y',
                         '-ss', str(start),
@@ -1218,12 +1372,33 @@ if __name__ == '__main__':
                         '-c:a', 'aac',
                         clip_temp_path
                     ]
-                    subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    cut_result = subprocess.run(cut_command, stdout=subprocess.DEVNULL,
+                                                 stderr=subprocess.PIPE)
+                    if cut_result.returncode != 0 or not os.path.exists(clip_temp_path):
+                        cut_err = (cut_result.stderr or b'').decode(errors='replace')[-2000:]
+                        raise RuntimeError(
+                            f"ffmpeg cut failed (rc={cut_result.returncode}) for "
+                            f"{clip_temp_path} (start={start}, end={end}). "
+                            f"stderr:\n{cut_err}"
+                        )
 
-                    success = render_clip(clip_temp_path, clip_final_path, output_format)
+                    success = render_clip(clip_temp_path, clip_final_path, output_format, reframe_mode)
+
+                    if success and render_defaults.branding.logo.enabled:
+                        # Save pre-brand intermediate for future re-branding
+                        shutil.copy2(clip_final_path, clip_pre_brand_path)
+                        # Resolve per-clip override and apply branding
+                        clip_override = render_overrides.get(str(i))
+                        effective = resolve_options(render_defaults, clip_override)
+                        apply_branding(clip_final_path, effective.branding, output_dir)
+
                     if success and os.environ.get("WATERMARK") == "1":
                         apply_watermark(clip_final_path)
                     if success:
+                        # Checkpoint AFTER branding + watermark so a resumed run
+                        # only skips clips that are truly final on disk.
+                        save_mission_result(output_dir, clip_mission_id,
+                                            {"filename": clip_filename})
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
                     return success
                 finally:
@@ -1232,15 +1407,30 @@ if __name__ == '__main__':
 
             clip_workers = max(int(os.environ.get("CLIP_WORKERS", "3")), 1)
             shorts = clips_data['shorts']
+            clips_succeeded = 0
             with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
                 futures = {pool.submit(_process_one_clip, i, clip): i
                            for i, clip in enumerate(shorts)}
                 for future in as_completed(futures):
                     i = futures[future]
                     try:
-                        future.result()
+                        if future.result():
+                            clips_succeeded += 1
                     except Exception as e:
                         print(f"   ❌ Clip {i+1} failed: {type(e).__name__}: {e}")
+
+            # If the analysis found clips but none actually rendered, the run
+            # failed even though each clip error was caught above. Exit non-zero
+            # so the backend marks the job 'failed' instead of reporting phantom
+            # clips whose .mp4 files never made it to disk (issue: gray clips /
+            # 404 on /videos/...). A partial success (some clips) is still a
+            # success — the good clips are usable.
+            if clips_succeeded == 0:
+                print(f"❌ All {len(shorts)} clips failed to render — no output produced.")
+                sys.exit(1)
+            elif clips_succeeded < len(shorts):
+                print(f"⚠️  {clips_succeeded}/{len(shorts)} clips rendered "
+                      f"({len(shorts) - clips_succeeded} failed).")
 
     # Clean up original if requested
     if args.url and not args.keep_original and os.path.exists(input_video):

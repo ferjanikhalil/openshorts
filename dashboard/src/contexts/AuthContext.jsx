@@ -4,15 +4,13 @@
 // - Exposes the current user, plan and minute balance to the app.
 // When billingEnabled is false the provider is inert and the app behaves as the
 // classic BYOK dashboard.
-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { getApiUrl } from '../config';
 import { apiFetch, apiJson, getToken, setToken, clearToken } from '../lib/api';
 import { track } from '../lib/analytics';
+import { AuthContext } from './auth-context';
 
-const AuthContext = createContext(null);
-export const useAuth = () => useContext(AuthContext);
-
-export function AuthProvider({ children }) {
+export default function AuthProvider({ children }) {
   const [config, setConfig] = useState({ billingEnabled: false, googleAuthEnabled: false });
   const [me, setMe] = useState(null);           // /api/me payload, or null when signed out
   const [loading, setLoading] = useState(true);

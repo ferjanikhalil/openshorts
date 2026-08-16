@@ -116,7 +116,7 @@
   }
   .btn-danger:hover { background: color-mix(in oklab, var(--color-danger) 12%, transparent); }
 
-  .badge-ok, .badge-warn, .badge-danger, .badge-brass {
+  .badge-ok, .badge-warn, .badge-danger, .badge-brass, .badge-quiet {
     font-family: var(--font-mono);
     font-size: 10.5px;
     letter-spacing: var(--tracking-micro);
@@ -131,6 +131,9 @@
   .badge-warn   { color: var(--color-warn);   background: color-mix(in oklab, var(--color-warn) 12%, transparent); }
   .badge-danger { color: var(--color-danger); background: color-mix(in oklab, var(--color-danger) 12%, transparent); }
   .badge-brass  { color: var(--color-accent); background: color-mix(in oklab, var(--color-accent) 12%, transparent); }
+  /* neutral badge — a state that is neither good nor bad nor pending on the
+     operator: queued, scheduled, skipped, cancelled */
+  .badge-quiet  { color: var(--color-muted); background: var(--color-paper-3); }
 
   /* narrow phones: tighter pill padding so CTA labels stay on one line */
   @media (max-width: 379px) {

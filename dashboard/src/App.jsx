@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Mail, Loader2, Download, FolderOpen, Send } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -18,9 +18,17 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import RenderOptionsPanel from './components/RenderOptionsPanel';
+import { loadBrandingDefaults } from './lib/branding';
+import BatchPipeline from './components/BatchPipeline';
+import BrandingSettings from './components/BrandingSettings';
+import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
+import PublishingTab from './components/publishing/PublishingTab';
+import PublishModal from './components/publishing/PublishModal';
+import { publishingHealth } from './lib/publishing';
 import Modal from './components/ui/Modal';
-import { useAuth } from './contexts/AuthContext';
+import { useAuth } from './contexts/auth-context';
 import { apiFetch, apiJson, QuotaError } from './lib/api';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -161,13 +169,81 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect }) => {
 };
 
 const SESSION_KEY = 'openshorts_session';
-const SESSION_MAX_AGE = 3600000; // 1 hour (matches server job retention)
+const SESSION_MAX_AGE = 86400000; // 24 hours (matches server job retention)
+const RECENT_PROJECTS_KEY = 'openshorts_recent_projects';
+const MAX_RECENT_PROJECTS = 10;
 
 // Mock polling function
 const pollJob = async (jobId) => {
   const res = await apiFetch(`/api/status/${jobId}`);
   if (!res.ok) throw new Error('Status check failed');
   return res.json();
+};
+
+// Header dropdown listing projects worked on in this browser, so the user can
+// jump back to one after clicking "New Project".
+const RecentProjectsMenu = ({ projects, currentJobId, reopeningId, onReopen }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  if (!projects || projects.length === 0) return null;
+
+  const fmt = (ts) => {
+    if (!ts) return '';
+    const mins = Math.round((Date.now() - ts) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.round(hrs / 24)}d ago`;
+  };
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setIsOpen((v) => !v)}
+        className="btn-quiet px-3 py-1.5 text-xs"
+        title="Return to a recent project"
+      >
+        <History size={14} />
+        <span className="hidden sm:inline">Recent</span>
+        <ChevronDown size={12} className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+      </button>
+
+      {isOpen && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setIsOpen(false)} />
+          <div className="absolute top-full left-0 mt-2 w-72 card overflow-hidden z-50">
+            <div className="px-4 py-2 border-b border-rule">
+              <span className="readout">Recent projects</span>
+            </div>
+            <div className="max-h-80 overflow-y-auto custom-scrollbar">
+              {projects.map((p) => (
+                <button
+                  key={p.jobId}
+                  onClick={() => { setIsOpen(false); onReopen(p); }}
+                  disabled={!!reopeningId}
+                  className="w-full flex items-center justify-between gap-3 px-4 py-3 hover:bg-paper3 transition-colors text-left border-b border-rule last:border-0 disabled:opacity-50"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-ink2 truncate">
+                      {p.title || 'Untitled project'}
+                    </div>
+                    <div className="readout mt-0.5">
+                      {p.clipCount ? `${p.clipCount} clip${p.clipCount === 1 ? '' : 's'} · ` : ''}{fmt(p.timestamp)}
+                    </div>
+                  </div>
+                  {reopeningId === p.jobId
+                    ? <Loader2 size={14} className="animate-spin text-brass shrink-0" />
+                    : p.jobId === currentJobId
+                      ? <Check size={14} className="text-brass shrink-0" />
+                      : <FolderOpen size={14} className="text-muted shrink-0" />}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
 };
 
 function App() {
@@ -183,6 +259,9 @@ function App() {
   const [durableClips, setDurableClips] = useState({});
 
   const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_key') || '');
+  const [llmConfig, setLlmConfig] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('llm_config') || 'null'); } catch { return null; }
+  });
   // Social API State - Load encrypted or plain
   const [uploadPostKey, setUploadPostKey] = useState(() => {
     const stored = localStorage.getItem('uploadPostKey_v3');
@@ -228,6 +307,41 @@ function App() {
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
+
+  // Automated publishing is an optional subsystem (PUBLISHING_ENABLED). Probed
+  // once so the nav entry and the batch "auto-post" button only appear on a
+  // deployment that actually has it — the routes 404 otherwise.
+  const [publishingOn, setPublishingOn] = useState(false);
+  const [showPublish, setShowPublish] = useState(false);
+
+  // Recent projects (this browser): a lightweight list so the user can jump back
+  // to a project after clicking "New Project". Persisted in localStorage.
+  const [recentProjects, setRecentProjects] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) || '[]'); }
+    catch { return []; }
+  });
+  const [reopeningRecent, setReopeningRecent] = useState(null);
+
+  // Upsert the given job into the recent-projects list (newest first, capped).
+  const rememberProject = (entry) => {
+    if (!entry?.jobId) return;
+    setRecentProjects((prev) => {
+      const next = [
+        { ...entry, timestamp: Date.now() },
+        ...prev.filter((p) => p.jobId !== entry.jobId),
+      ].slice(0, MAX_RECENT_PROJECTS);
+      try { localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(next)); } catch { /* full */ }
+      return next;
+    });
+  };
+
+  const forgetProject = (projectJobId) => {
+    setRecentProjects((prev) => {
+      const next = prev.filter((p) => p.jobId !== projectJobId);
+      try { localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  };
 
   // Silent-success "saved" states for the settings key inputs (design.md: no alert popups)
   const [elevenLabsSaved, setElevenLabsSaved] = useState(false);
@@ -294,6 +408,46 @@ function App() {
     setQualityGate(null);
     setStatus('complete');
     setActiveTab('dashboard');
+    rememberProject({
+      jobId: data.job_id,
+      title: data.result?.clips?.[0]?.title || '',
+      clipCount: data.result?.clips?.length || 0,
+      managed: true,
+    });
+  };
+
+  // Reopen a project from the header's "Recent" menu. Managed users get a full
+  // R2 restore; otherwise we re-poll the still-live job (server keeps it ~1h).
+  const reopenRecentProject = async (entry) => {
+    if (!entry?.jobId || reopeningRecent) return;
+    if (entry.jobId === jobId && status !== 'idle') return; // already open
+    setReopeningRecent(entry.jobId);
+    try {
+      if (isManaged || entry.managed) {
+        await restoreProject(entry.jobId);
+      } else {
+        const data = await pollJob(entry.jobId);
+        if (!data || (data.status !== 'completed' && !data.result)) {
+          throw new Error('expired');
+        }
+        flushClipState();
+        setProjectState(null);
+        setNoSource(false);
+        setJobId(entry.jobId);
+        setResults(data.result || null);
+        setLogs(['♻️ Reopened a recent project.']);
+        setProcessingMedia({ type: 'server', payload: `/api/source/${entry.jobId}` });
+        setQualityGate(null);
+        setStatus('complete');
+        setActiveTab('dashboard');
+        rememberProject({ ...entry });
+      }
+    } catch (e) {
+      forgetProject(entry.jobId);
+      alert('This project is no longer available — it may have expired.');
+    } finally {
+      setReopeningRecent(null);
+    }
   };
 
   // Apply one subtitle style to every clip of the job, sequentially.
@@ -425,11 +579,29 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, status, results, activeTab, noSource, projectState]);
 
+  // Record every completed job into the Recent menu so "New Project" never
+  // strands the user's finished work.
+  useEffect(() => {
+    if (status === 'complete' && jobId && results?.clips?.length) {
+      rememberProject({
+        jobId,
+        title: results.clips[0]?.title || '',
+        clipCount: results.clips.length,
+        managed: isManaged,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, jobId, results]);
+
   useEffect(() => {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
     // For now keeping gemini plain for compatibility unless requested.
     if (apiKey) localStorage.setItem('gemini_key', apiKey);
   }, [apiKey]);
+
+  useEffect(() => {
+    if (llmConfig) localStorage.setItem('llm_config', JSON.stringify(llmConfig));
+  }, [llmConfig]);
 
   useEffect(() => {
     if (uploadPostKey) {
@@ -538,7 +710,15 @@ function App() {
 
   // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  const keysMissing = !billingEnabled && (!apiKey || !uploadPostKey);
+  // Two INDEPENDENT keys (self-host BYOK): a general provider (OmniRoute) for clip
+  // generation, and a Gemini key required by Auto Edit (Files API / multimodal).
+  // Legacy: a Gemini key alone still counts as a general provider (resolve_llm_env's
+  // default branch falls back to Gemini), so existing Gemini-only users keep working.
+  const hasGeneralProvider = llmConfig?.provider === 'openai_compat'
+    ? !!(llmConfig.baseUrl && llmConfig.model)
+    : !!apiKey;
+  const hasGeminiKey = !!apiKey;
+  const keysMissing = !billingEnabled && (!hasGeneralProvider || !hasGeminiKey || !uploadPostKey);
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: show the welcome plan-choice popup once (AuthContext set the
@@ -554,8 +734,16 @@ function App() {
       }
     }
   }, [billingEnabled, isSignedIn]);
-  // Included in the plan (fully managed, no keys): Clip Generator + YouTube Studio.
-  // Advanced (bring your own fal.ai + ElevenLabs keys): AI Shorts + AI Agent.
+
+  // One probe at mount. publishingHealth() swallows its own errors and reports
+  // `enabled: false`, so a deployment without publishing simply hides it.
+  useEffect(() => {
+    let cancelled = false;
+    publishingHealth().then((h) => { if (!cancelled) setPublishingOn(!!h.enabled); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Included in the plan (fully managed, no keys): Clip Generator + YouTube Studio.  // Advanced (bring your own fal.ai + ElevenLabs keys): AI Shorts + AI Agent.
   const INCLUDED_TOOL_TABS = ['dashboard', 'thumbnails'];
   const ADVANCED_TOOL_TABS = ['saasshorts', 'ai-agent'];
   const TOOL_NAMES = { dashboard: 'the Clip Generator', thumbnails: 'the YouTube Studio' };
@@ -603,27 +791,73 @@ function App() {
 
     try {
       let body;
-      // BYOK sends the Gemini header; managed users rely on the bearer token
-      // that apiFetch attaches automatically.
-      const headers = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+      // Route clip generation to the configured provider. OmniRoute → X-LLM-*
+      // (don't also send X-Gemini-Key here; Auto Edit handles its own Gemini key
+      // separately). Legacy Gemini-only users fall back to X-Gemini-Key for the
+      // general pipeline. Managed users rely on the bearer token apiFetch sets.
+      const headers = {};
+      if (llmConfig?.provider === 'openai_compat') {
+        headers['X-LLM-Provider'] = 'openai_compat';
+        headers['X-LLM-Base-URL'] = llmConfig.baseUrl || '';
+        headers['X-LLM-Key'] = llmConfig.apiKey || '';
+        headers['X-LLM-Model'] = llmConfig.model || '';
+      } else if (apiKey) {
+        headers['X-Gemini-Key'] = apiKey;
+      }
+
+      // Upload progress callback for file uploads
+      const onProgress = data.type === 'file' ? (progress) => {
+        setLogs([`Uploading video... ${progress.percent}% (${Math.round(progress.loaded / 1024 / 1024)}MB / ${Math.round(progress.total / 1024 / 1024)}MB)`]);
+      } : null;
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({
+        const jsonBody = {
           url: data.payload,
           acknowledged: !!data.acknowledged,
           output_format: data.outputFormat || 'auto',
+          reframe_mode: data.reframeMode || 'auto',
+          clip_duration_mode: data.clipDurationMode || 'auto',
           force_low_quality: forceLowQuality,
-        });
+        };
+        const brandingDefaults = loadBrandingDefaults();
+        if (brandingDefaults?.enabled && brandingDefaults?.logoDataUrl) {
+          jsonBody.branding = {
+            logo: {
+              enabled: true,
+              position: brandingDefaults.position || 'bottom_right',
+              size_pct: brandingDefaults.size_pct ?? 15,
+              opacity: brandingDefaults.opacity ?? 1,
+              margin_px: brandingDefaults.margin_px ?? 20,
+              logo_image_data: brandingDefaults.logoDataUrl,
+            },
+          };
+        }
+        body = JSON.stringify(jsonBody);
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         formData.append('output_format', data.outputFormat || 'auto');
+        formData.append('reframe_mode', data.reframeMode || 'auto');
+        formData.append('clip_duration_mode', data.clipDurationMode || 'auto');
+        const brandingDefaults = loadBrandingDefaults();
+        if (brandingDefaults?.enabled && brandingDefaults?.logoDataUrl) {
+          formData.append('branding', JSON.stringify({
+            logo: {
+              enabled: true,
+              position: brandingDefaults.position || 'bottom_right',
+              size_pct: brandingDefaults.size_pct ?? 15,
+              opacity: brandingDefaults.opacity ?? 1,
+              margin_px: brandingDefaults.margin_px ?? 20,
+              logo_image_data: brandingDefaults.logoDataUrl,
+            },
+          }));
+        }
         body = formData;
       }
 
-      const res = await apiFetch('/api/process', { method: 'POST', headers, body });
+      const res = await apiFetch('/api/process', { method: 'POST', headers, body, onProgress });
 
       if (!res.ok) throw new Error(await res.text());
       const resData = await res.json();
@@ -637,6 +871,7 @@ function App() {
       }
 
       setJobId(resData.job_id);
+      setLogs(["Upload complete. Starting video processing..."]);
 
     } catch (e) {
       if (e instanceof QuotaError) {
@@ -679,8 +914,9 @@ function App() {
       { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', byok: true },
       { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery' },
       { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio' },
-      ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History' }] : []),
-      { id: 'settings', ord: '07', icon: Settings, label: 'Settings' },
+      ...(publishingOn ? [{ id: 'publishing', ord: '06', icon: Send, label: 'Publishing' }] : []),
+      ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History' }] : []),
+      { id: 'settings', ord: '08', icon: Settings, label: 'Settings' },
     ];
 
     return (
@@ -768,6 +1004,14 @@ function App() {
                 <Plus size={14} />
                 <span className="hidden sm:inline">New Project</span>
               </button>
+            )}
+            {activeTab === 'dashboard' && (
+              <RecentProjectsMenu
+                projects={recentProjects}
+                currentJobId={jobId}
+                reopeningId={reopeningRecent}
+                onReopen={reopenRecentProject}
+              />
             )}
           </div>
 
@@ -923,7 +1167,7 @@ function App() {
                 </div>
               ) : (
                 <>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              <KeyInput onKeySet={setApiKey} savedKey={apiKey} llmConfig={llmConfig} onLlmConfigChange={setLlmConfig} />
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -1037,6 +1281,8 @@ function App() {
                 </div>
               </div>
 
+              <BrandingSettings />
+
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
                   <div className="flex items-center gap-3">
@@ -1102,120 +1348,16 @@ function App() {
             <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} managed={isManaged} />
           )}
 
-          {/* View: AI Agent */}
+          {/* View: AI Agent (Autopilot) */}
           {activeTab === 'ai-agent' && (
-            <div className="h-full overflow-y-auto custom-scrollbar p-4 sm:p-6 md:p-10 animate-fade">
-              <div className="max-w-4xl mx-auto space-y-8">
-
-                {/* Header */}
-                <div className="space-y-3">
-                  <p className="eyebrow flex items-center gap-2">
-                    <Bot size={12} /> 03 · AI AGENT · AUTONOMOUS SKILL
-                  </p>
-                  <h1 className="font-display lowercase text-3xl md:text-4xl text-ink">
-                    Your Personal Clipping Team
-                  </h1>
-                  <p className="text-muted text-base md:text-lg leading-relaxed max-w-2xl">
-                    Drop your videos in a folder and a team of AI clippers picks the viral moments, edits them, and queues them for your approval — like having a 24/7 short-form editing crew on autopilot.
-                  </p>
-                </div>
-
-                {/* Mobile-format warning */}
-                <div className="px-4 py-3 rounded-card border border-rule bg-paper2 flex items-start gap-3">
-                  <Smartphone size={18} className="text-warn shrink-0 mt-0.5" />
-                  <div className="text-sm text-ink2">
-                    <p className="font-medium text-ink mb-1">Upload videos already in vertical (9:16) mobile format.</p>
-                    <p className="text-muted leading-relaxed">
-                      The agent does not reframe horizontal footage. Make sure every source video is shot or pre-cropped to mobile/portrait format before dropping it into the input folder.
-                    </p>
-                  </div>
-                </div>
-
-                {/* Workflow */}
-                <div className="grid md:grid-cols-3 gap-4">
-                  <div className="card p-5 space-y-2">
-                    <div className="w-10 h-10 rounded-input bg-paper3 flex items-center justify-center">
-                      <Upload size={18} className="text-brass" />
-                    </div>
-                    <h3 className="font-medium text-ink lowercase">1. Drop your videos</h3>
-                    <p className="text-xs text-muted leading-relaxed">
-                      Put your long-form vertical footage in the watched folder. The skill picks one video per run.
-                    </p>
-                  </div>
-
-                  <div className="card p-5 space-y-2">
-                    <div className="w-10 h-10 rounded-input bg-paper3 flex items-center justify-center">
-                      <Users size={18} className="text-brass" />
-                    </div>
-                    <h3 className="font-medium text-ink lowercase">2. AI clippers work</h3>
-                    <p className="text-xs text-muted leading-relaxed">
-                      Whisper transcribes, Gemini 3 Flash spots viral beats, FFmpeg cuts each clip and adds a hook overlay.
-                    </p>
-                  </div>
-
-                  <div className="card p-5 space-y-2">
-                    <div className="w-10 h-10 rounded-input bg-paper3 flex items-center justify-center">
-                      <CheckCircle2 size={18} className="text-brass" />
-                    </div>
-                    <h3 className="font-medium text-ink lowercase">3. You validate, it ships</h3>
-                    <p className="text-xs text-muted leading-relaxed">
-                      Approve the candidates you like and the skill auto-publishes them to TikTok, Reels and YouTube Shorts via Upload-Post.
-                    </p>
-                  </div>
-                </div>
-
-                {/* Repo CTA */}
-                <div className="card p-6 md:p-8 space-y-5">
-                  <div className="flex items-start justify-between gap-4 flex-wrap">
-                    <div>
-                      <h2 className="font-display lowercase text-xl text-ink mb-1">skill-autoshorts</h2>
-                      <p className="text-sm text-muted">
-                        The Claude Code skill that powers this workflow. Install it once and trigger it whenever you want a fresh batch of clips.
-                      </p>
-                    </div>
-                    <a
-                      href="https://github.com/mutonby/skill-autoshorts"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="btn-primary py-2 px-4 text-sm shrink-0"
-                    >
-                      View on GitHub <ExternalLink size={14} />
-                    </a>
-                  </div>
-
-                  <div className="bg-paper border border-rule rounded-card p-4 font-mono text-xs text-ink2 flex items-center justify-between gap-3">
-                    <span className="truncate">git clone https://github.com/mutonby/skill-autoshorts</span>
-                    <button
-                      onClick={() => navigator.clipboard.writeText('git clone https://github.com/mutonby/skill-autoshorts')}
-                      className="text-muted hover:text-ink transition-colors shrink-0"
-                      title="Copy"
-                    >
-                      <Copy size={14} />
-                    </button>
-                  </div>
-
-                  <div className="grid sm:grid-cols-2 gap-3 text-sm">
-                    <div className="flex items-start gap-2 text-ink2">
-                      <Check size={16} className="text-brass shrink-0 mt-0.5" />
-                      <span>Daily batch — picks one long video per run</span>
-                    </div>
-                    <div className="flex items-start gap-2 text-ink2">
-                      <Check size={16} className="text-brass shrink-0 mt-0.5" />
-                      <span>Whisper transcription with word-level timing</span>
-                    </div>
-                    <div className="flex items-start gap-2 text-ink2">
-                      <Check size={16} className="text-brass shrink-0 mt-0.5" />
-                      <span>Gemini 3 Flash multimodal moment detection</span>
-                    </div>
-                    <div className="flex items-start gap-2 text-ink2">
-                      <Check size={16} className="text-brass shrink-0 mt-0.5" />
-                      <span>Auto-publish to TikTok, Reels & YouTube Shorts</span>
-                    </div>
-                  </div>
-                </div>
-
-              </div>
-            </div>
+            <AutopilotTab
+              geminiApiKey={apiKey}
+              llmConfig={llmConfig}
+              elevenLabsKey={elevenLabsKey}
+              uploadPostKey={uploadPostKey}
+              uploadUserId={uploadUserId}
+              isManaged={isManaged}
+            />
           )}
 
           {/* View: UGC Gallery */}
@@ -1232,6 +1374,15 @@ function App() {
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-6 md:p-8">
                 <HistoryTab onReopenProject={restoreProject} />
+              </div>
+            </div>
+          )}
+
+          {/* View: Publishing (automated posting) */}
+          {activeTab === 'publishing' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="p-6 md:p-8">
+                <PublishingTab />
               </div>
             </div>
           )}
@@ -1261,6 +1412,7 @@ function App() {
                 </div>
 
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <RenderOptionsPanel />
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>
@@ -1370,6 +1522,16 @@ function App() {
                           schedule week
                         </button>
                       )}
+                      {publishingOn && (
+                        <button
+                          onClick={() => setShowPublish(true)}
+                          className="btn-ghost px-4 py-2 text-xs"
+                          title="Post these clips to your connected accounts, spaced out"
+                        >
+                          <Send size={14} />
+                          auto-post
+                        </button>
+                      )}
                     </div>
                   )}
                 </h2>
@@ -1385,6 +1547,19 @@ function App() {
                         Free clips carry a watermark and expire in 7 days — <span className="text-brass">upgrade to remove both</span>.
                       </button>
                     )}
+                    <BatchPipeline
+                      jobId={jobId}
+                      clipCount={results.clips.length}
+                      apiKey={apiKey}
+                      elevenLabsKey={elevenLabsKey}
+                      previewVideoUrl={results.clips[0]?.video_url}
+                      onComplete={async () => {
+                        try {
+                          const data = await pollJob(jobId);
+                          if (data.result) setResults(data.result);
+                        } catch { /* keep current */ }
+                      }}
+                    />
                   </div>
                 )}
 
@@ -1442,11 +1617,13 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!apiKey && !uploadPostKey
+        title={!hasGeneralProvider && !apiKey && !uploadPostKey
           ? 'Required API Keys Missing'
-          : !apiKey
-            ? 'Gemini API Key Required'
-            : 'Upload-Post API Key Required'}
+          : (!hasGeneralProvider && !apiKey)
+            ? 'LLM Provider Missing'
+            : !apiKey
+              ? 'Gemini API Key Required'
+              : 'Upload-Post API Key Required'}
         footer={
           <div className="flex gap-3">
             <button
@@ -1466,8 +1643,20 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            OpenShorts needs an <strong className="text-ink2">LLM provider</strong> (OmniRoute or a Gemini key) for clip generation, a separate <strong className="text-ink2">Gemini</strong> key for Auto Edit, and an <strong className="text-ink2">Upload-Post</strong> key for posting. All have free tiers.
           </p>
+
+          {!hasGeneralProvider && (
+            <div className="rounded-input p-4 space-y-2 border border-rule2">
+              <p className="text-xs font-medium text-ink flex items-center gap-2">
+                <AlertTriangle size={12} className="text-warn" />
+                General LLM Provider (clip generation)
+              </p>
+              <p className="text-xs text-muted">
+                Set an OmniRoute / OpenAI-compatible endpoint (Base URL + Model) in Settings — or just set the Gemini key below, which also works as the general provider.
+              </p>
+            </div>
+          )}
 
           {/* Gemini block */}
           <div className={`rounded-input p-4 space-y-2 border ${!apiKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
@@ -1539,6 +1728,16 @@ function App() {
         uploadUserId={uploadUserId}
         isManaged={isManaged}
       />
+
+      {/* Automated publishing: whole-job mode (no clip_index) */}
+      {publishingOn && showPublish && (
+        <PublishModal
+          isOpen={showPublish}
+          onClose={() => setShowPublish(false)}
+          jobId={jobId}
+          clipCount={results?.clips?.length || 0}
+        />
+      )}
 
       {/* Pre-flight quality gate */}
       {qualityGate && (

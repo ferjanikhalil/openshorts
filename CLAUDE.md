@@ -79,7 +79,19 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | POST | `/api/social/post` | Post to social media (async upload) |
 
 ### Concurrency Model
-Async job queue with semaphore-based concurrency control. Configure via `MAX_CONCURRENT_JOBS` env var (default: 5). Jobs auto-cleanup after 1 hour.
+Async job queue with semaphore-based concurrency control. Configure via `MAX_CONCURRENT_JOBS` env var (default: 5). Finished jobs (clips + source) auto-cleanup after `JOB_RETENTION_SECONDS` (default: 24 hours); this also bounds how long a project stays re-openable from the header's "Recent" menu in self-host mode.
+
+## Automated Publishing (`publishing/`)
+
+Optional subsystem that posts finished clips to YouTube Shorts, Instagram Reels and TikTok. Dormant unless `PUBLISHING_ENABLED` is set — independent of `BILLING_ENABLED` (works in self-host and cloud), but **requires Postgres** regardless of mode, because duplicate-post prevention, retry state and the audit trail have to survive a redeploy. Full detail lives in [`publishing/README.md`](publishing/README.md); this is the map.
+
+- **Provider abstraction.** `providers/base.py` defines a 5-method `Provider` protocol + a `Capabilities` dataclass. There is no `if provider == "status200"` anywhere outside `providers/` — adding a provider is a new file plus a registry entry (mirrors `batch.OPERATIONS`). The first (only) adapter is **Status 200** (`providers/status200.py`); `providers/fake.py` mirrors its capabilities exactly and backs `PUBLISHING_DRY_RUN=1`, so the full pipeline runs with no credential and no real post.
+- **Unit of publication is the destination, not the batch.** A `publish_group` ("Batch" in the UI) is a reusable bundle of `publish_destination` rows sharing one provider credential; a `publish_request` may span groups. This is what lets single-account, hand-picked multi-account, and whole-batch publishing share one code path (`service.expand_destinations`) instead of three.
+- **Credentials are never exposed.** Entered through the admin UI only, sealed with AES-256-GCM before touching the database (`crypto.py`), and the API returns only a `fingerprint` + `last4` — never the plaintext. No provider key belongs in `.env`, compose files, frontend code, or logs.
+- **`unknown` is terminal and never auto-retried.** A submit timeout is ambiguous (the post may already be live); blindly retrying it risks double-publishing to a real audience. A human resolves it.
+- **The duplicate-post guard is a DB constraint**, not application logic: a partial unique index on `publish_attempts (publish_request_id, publish_destination_id)` for live/won states. `state.LIVE_STATES` must stay in lockstep with it.
+- **Migrations.** The repo boots via `create_all`; `alembic/versions/20260809_publishing_baseline.py` is written defensively (checks the live catalogue before creating anything) so it's safe whether or not the tables already exist.
+- **Tests** (`tests/test_publishing_*.py`) run in CI with no Postgres, no credentials, no network — pure-logic suites plus a provider contract suite against `httpx.MockTransport`.
 
 ## Environment Variables
 
@@ -94,6 +106,10 @@ Async job queue with semaphore-based concurrency control. Configure via `MAX_CON
 - `UPLOAD_POST_API_KEY` - Upload-Post API key for social posting (optional)
 
 > API keys are stored encrypted in the browser and sent via headers only when needed. Never stored server-side.
+
+**Publishing (`PUBLISHING_ENABLED`, server-side only):** `DATABASE_URL`, `PUBLISHING_MASTER_KEY` (32 bytes base64, wraps stored credentials), `PUBLISHING_MASTER_KEY_OLD` (rotation window), `PUBLISHING_ADMIN_TOKEN` / `PUBLISHING_ADMIN_EMAILS` (without one the admin router stays unmounted and nothing can publish), `PUBLISHING_PUBLIC_BASE_URL` (origin **the provider** fetches clips from — `localhost` cannot work), `PUBLISHING_DRY_RUN`, plus queue tuning. See `.env.example`.
+
+> Provider API keys are NOT env vars. They are entered through the admin UI, encrypted server-side, and never returned to the frontend.
 
 ## Tech Stack
 - **Backend:** Python 3.11, FastAPI, google-genai, faster-whisper, ultralytics (YOLOv8), mediapipe, opencv-python, yt-dlp, FFmpeg, httpx

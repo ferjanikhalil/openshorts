@@ -1,0 +1,69 @@
+# Automated-publishing override.
+#
+# Usage — self-host + publishing (no billing):
+#   docker compose -f docker-compose.yml -f docker-compose.publishing.yml up --build
+# Usage — cloud + publishing:
+#   docker compose -f docker-compose.yml -f docker-compose.cloud.yml \
+#                  -f docker-compose.publishing.yml up --build
+#
+# The `db` service below is byte-identical to the one in docker-compose.cloud.yml
+# so layering both files is a merge, not a conflict. Publishing needs Postgres on
+# its own terms: the duplicate-post guard, the retry clock and the audit trail
+# are durability requirements, and a guard that forgets on redeploy is not one.
+#
+# NO PROVIDER API KEY APPEARS HERE. Status 200 keys are entered through the admin
+# UI, sealed with AES-256-GCM and never returned to the frontend. The only secret
+# in this file is the master key that wraps them, and it comes from the host env.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: openshorts-db
+    environment:
+      - POSTGRES_USER=openshorts
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set when publishing is enabled}
+      - POSTGRES_DB=openshorts
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openshorts"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - PUBLISHING_ENABLED=true
+      - DATABASE_URL=postgresql+asyncpg://openshorts:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set when publishing is enabled}@db:5432/openshorts
+      # 32 bytes, base64. Generate once and keep it: losing it means every stored
+      # credential has to be re-entered.
+      #   python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+      - PUBLISHING_MASTER_KEY=${PUBLISHING_MASTER_KEY:?PUBLISHING_MASTER_KEY must be set when publishing is enabled}
+      # Set during a key rotation window, then removed.
+      - PUBLISHING_MASTER_KEY_OLD=${PUBLISHING_MASTER_KEY_OLD:-}
+      # Who may configure credentials. Without one of these the admin router
+      # stays unmounted and the Publishing tab says so instead of half-working.
+      - PUBLISHING_ADMIN_TOKEN=${PUBLISHING_ADMIN_TOKEN:-}
+      - PUBLISHING_ADMIN_EMAILS=${PUBLISHING_ADMIN_EMAILS:-}
+      # The origin the PROVIDER fetches clips from — not the browser's origin.
+      # A localhost value cannot work: Status 200 has to reach it from outside.
+      - PUBLISHING_PUBLIC_BASE_URL=${PUBLISHING_PUBLIC_BASE_URL:-}
+      - PUBLISHING_MEDIA_URL_TTL=${PUBLISHING_MEDIA_URL_TTL:-3600}
+      # Defaults to ON here on purpose. The full pipeline runs against the in-repo
+      # fake provider, so a first `up` cannot post to a real account by accident.
+      # Set PUBLISHING_DRY_RUN=false in the host env when you are ready.
+      - PUBLISHING_DRY_RUN=${PUBLISHING_DRY_RUN:-true}
+      - PUBLISHING_DEFAULT_PROVIDER=${PUBLISHING_DEFAULT_PROVIDER:-status200}
+      # Queue tuning — see .env.example for what each one governs.
+      - PUBLISHING_MAX_ATTEMPTS=${PUBLISHING_MAX_ATTEMPTS:-5}
+      - PUBLISHING_DISPATCH_INTERVAL=${PUBLISHING_DISPATCH_INTERVAL:-5}
+      - PUBLISHING_RECONCILE_INTERVAL=${PUBLISHING_RECONCILE_INTERVAL:-60}
+      - PUBLISHING_SUBMIT_TIMEOUT=${PUBLISHING_SUBMIT_TIMEOUT:-1800}
+      - PUBLISHING_MAX_CONCURRENT_UPLOADS=${PUBLISHING_MAX_CONCURRENT_UPLOADS:-4}
+      - PUBLISHING_PER_CREDENTIAL_CONCURRENCY=${PUBLISHING_PER_CREDENTIAL_CONCURRENCY:-1}
+
+volumes:
+  pgdata:

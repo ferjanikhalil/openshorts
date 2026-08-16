@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Share2, Calendar, Upload } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
@@ -81,8 +81,6 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [actorGallery, setActorGallery] = useState([]);
   const [loadingGallery, setLoadingGallery] = useState(false);
   const [uploadedActorPreview, setUploadedActorPreview] = useState(null); // {localPreview, serverUrl}
-  const [productPhoto, setProductPhoto] = useState(null); // {preview, serverUrl}
-  const [productDescription, setProductDescription] = useState('');
 
   // Step 3: Generate
   const [generating, setGenerating] = useState(false);
@@ -102,12 +100,14 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [copied, setCopied] = useState('');
   const [logsExpanded, setLogsExpanded] = useState(true);
 
-  // Pre-fill from cache on mount
+  // Pre-fill from cache on mount. Intentionally runs once — re-firing on
+  // scripts/actorDescription changes would clobber the user's later edits.
   useEffect(() => {
     if (fromCache && scripts.length > 0 && !actorDescription) {
       setActorDescription(scripts[0].actor_description || '');
       setEditedNarration(scripts[0].full_narration || '');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Fetch actor gallery on mount
@@ -120,14 +120,30 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       .finally(() => setLoadingGallery(false));
   }, []);
 
+  const fetchVoices = useCallback(async () => {
+    try {
+      const res = await fetch(getApiUrl('/api/saasshorts/voices'), {
+        headers: { 'X-ElevenLabs-Key': elevenLabsKey },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setVoices(data.voices || []);
+      }
+    } catch (e) {
+      console.error('Voices fetch error:', e);
+    }
+  }, [elevenLabsKey]);
+
   // Fetch voices on mount
   useEffect(() => {
     if (elevenLabsKey) {
       fetchVoices();
     }
-  }, [elevenLabsKey]);
+  }, [elevenLabsKey, fetchVoices]);
 
   // Reset selected voice when actor gender changes
+  const voicesRef = useRef(voices);
+  voicesRef.current = voices;
   useEffect(() => {
     const genderDefaults = {
       'en-female': '21m00Tcm4TlvDq8ikWAM',  // Rachel
@@ -135,8 +151,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       'es-female': 'EXAVITQu4vr4xnSDxMaL',  // Bella
       'es-male': 'ErXwobaYiN019PkySvjV',     // Antoni
     };
-    // If we have fetched voices, pick the first matching one; otherwise use hardcoded default
-    const matchingVoice = voices.find(v => (v.labels?.gender || '').toLowerCase() === actorGender);
+    // If we have fetched voices, pick the first matching one; otherwise use hardcoded default.
+    // Read voices via ref so this fires only on gender/language change, not when
+    // voices load (which would override a manually chosen voice).
+    const matchingVoice = voicesRef.current.find(v => (v.labels?.gender || '').toLowerCase() === actorGender);
     if (matchingVoice) {
       setSelectedVoice(matchingVoice.voice_id);
     } else {
@@ -180,20 +198,6 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     }
     return () => clearInterval(interval);
   }, [jobId, genStatus]);
-
-  const fetchVoices = async () => {
-    try {
-      const res = await fetch(getApiUrl('/api/saasshorts/voices'), {
-        headers: { 'X-ElevenLabs-Key': elevenLabsKey },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setVoices(data.voices || []);
-      }
-    } catch (e) {
-      console.error('Voices fetch error:', e);
-    }
-  };
 
   const handleAnalyze = async () => {
     if (!url.trim() && !description.trim()) return;

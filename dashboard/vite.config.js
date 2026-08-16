@@ -16,12 +16,24 @@ export default defineConfig({
       'www.openshorts.app'
     ],
     proxy: {
-      '/api': { target: backend, changeOrigin: true },
-      '/videos': { target: backend, changeOrigin: true },
-      '/thumbnails': { target: backend, changeOrigin: true },
-      '/gallery': { target: backend, changeOrigin: true },
-      '/video': { target: backend, changeOrigin: true },
-      '/render': { target: renderer, changeOrigin: true },
+      '/api': {
+        target: backend,
+        changeOrigin: true,
+        timeout: 0,
+        configure: (proxy) => {
+          // Handle large file uploads without crashing
+          proxy.on('proxyReq', (proxyReq, req) => {
+            if (req.headers['content-type']?.includes('multipart/form-data')) {
+              proxyReq.setHeader('Transfer-Encoding', 'chunked');
+            }
+          });
+        }
+      },
+      '/videos': { target: backend, changeOrigin: true, timeout: 0 },
+      '/thumbnails': { target: backend, changeOrigin: true, timeout: 0 },
+      '/gallery': { target: backend, changeOrigin: true, timeout: 0 },
+      '/video': { target: backend, changeOrigin: true, timeout: 0 },
+      '/render': { target: renderer, changeOrigin: true, timeout: 0 },
     }
   }
 })

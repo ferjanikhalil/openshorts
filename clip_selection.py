@@ -1,11 +1,13 @@
 """
-Pure helpers for the Gemini clip-selection pipeline.
+Pure helpers for the LLM clip-selection pipeline.
 
 Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
 
-# USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
+# USD per 1M tokens (input, output incl. thinking).
+# Unknown models (e.g. OpenAI-compat endpoints) return None from
+# lookup_model_prices and get a conservative estimate in _calculate_cost_analysis.
 MODEL_PRICES = {
     "gemini-3.5-flash": (1.50, 9.00),
     "gemini-3.1-flash-lite": (0.25, 1.50),

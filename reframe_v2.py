@@ -156,8 +156,12 @@ def _run(cmd):
                    stderr=subprocess.PIPE, timeout=1800)
 
 
-def render(input_video, final_output_video, aspect_ratio):
-    """Full v2 reframe of one clip. Raises on failure (caller falls back)."""
+def render(input_video, final_output_video, aspect_ratio, reframe_mode="auto"):
+    """Full v2 reframe of one clip. Raises on failure (caller falls back).
+
+    reframe_mode: 'auto' (per-scene detection), 'track' (always follow the
+    subject) or 'general' (always full-width blurred layout — gaming/screen
+    share where a facecam would otherwise pull the crop onto the streamer)."""
     import main as m
 
     print("   🚀 Reframe engine v2 (ffmpeg-native render)")
@@ -184,7 +188,8 @@ def render(input_video, final_output_video, aspect_ratio):
         scenes = [(FrameTimecode(0, fps), FrameTimecode(total, fps))]
 
     scene_boundaries = [(s.get_frames(), e.get_frames()) for s, e in scenes]
-    strategies = m.analyze_scenes_strategy(input_video, scenes)
+    strategies = m.analyze_scenes_strategy(
+        input_video, scenes, force_strategy=m.reframe_mode_to_strategy(reframe_mode))
 
     cameraman = m.SmoothedCameraman(out_w, out_h, orig_w, orig_h, aspect_ratio=aspect_ratio)
     tracker = m.SpeakerTracker(cooldown_frames=30)
@@ -239,6 +244,7 @@ def render(input_video, final_output_video, aspect_ratio):
             "-i", input_video,
             "-map", "0:v:0", "-map", "1:a:0?",
             "-c:v", "copy", "-c:a", "copy",
+            "-movflags", "+faststart",
             final_output_video,
         ])
     finally:

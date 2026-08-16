@@ -53,13 +53,52 @@ def detect_scenes(video_path):
 
 # --- legacy engine ----------------------------------------------------------
 
+def _total_frames(video):
+    """Total frame count for progress reporting, or 0 if unknowable.
+
+    VideoStream.duration is a FrameTimecode, but it is None for streams that
+    cannot report a length. Only used for the progress percentage, so any
+    failure degrades to "no progress output" rather than to an exception.
+    """
+    try:
+        duration = getattr(video, "duration", None)
+        if duration is None:
+            return 0
+        return int(getattr(duration, "frame_number", duration))
+    except Exception:
+        return 0
+
+
 def _detect_pyscenedetect(video_path):
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector())
-    scene_manager.detect_scenes(video=video)
+
+    # Total frames for progress reporting. scenedetect ≥0.6 changed the
+    # callback signature from (frame_number, total_frames) to
+    # (frame_number, position: FrameTimecode), so the total has to come from
+    # the video object instead of the second callback argument.
+    _total = _total_frames(video)
+
+    # Print progress every 10% so long videos don't go silent. Wrapped so a
+    # reporting slip can never abort detection the way the old signature
+    # mismatch did.
+    def _progress(current_frame, *_):
+        try:
+            if _total > 0:
+                pct = int(int(current_frame) / _total * 100)
+                # Print at 10% intervals
+                if pct >= _progress.next_pct:
+                    print(f"🎬 Scene detection (PySceneDetect)… {_progress.next_pct}%")
+                    _progress.next_pct = min(100, _progress.next_pct + 10)
+        except Exception:
+            pass
+
+    _progress.next_pct = 10
+    scene_manager.detect_scenes(video=video, callback=_progress)
     scene_list = scene_manager.get_scene_list()
     fps = video.frame_rate
+    print("🎬 Scene detection (PySceneDetect)… 100%")
     return scene_list, fps
 
 
@@ -78,13 +117,24 @@ def _get_tn2_model():
 
 def _extract_frames_small(video_path):
     """Decode the whole clip as 48x27 RGB frames via ffmpeg (~4KB/frame)."""
+    # Scale timeout with video duration: ~2x realtime at 48x27 is generous.
+    # A 30-min video gets 3600s; a 5-min clip gets 600s. Minimum 900s.
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    cap.release()
+    duration_s = frames / fps if fps else 0
+    timeout = max(900, int(duration_s * 2))
+
     cmd = [
         "ffmpeg", "-nostdin", "-i", video_path,
         "-vf", f"scale={_TN2_W}:{_TN2_H}",
         "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, check=True, timeout=900)
+                          stderr=subprocess.DEVNULL, check=True,
+                          timeout=timeout)
     frame_bytes = _TN2_H * _TN2_W * 3
     n = len(proc.stdout) // frame_bytes
     if n == 0:
@@ -99,7 +149,13 @@ def _detect_transnetv2(video_path):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration_s = total_frames / fps if fps else 0
     cap.release()
+
+    # Skip TransNetV2 for videos longer than 30 minutes - the memory and time
+    # cost of decoding 162k+ frames to 48x27 is prohibitive
+    if duration_s > 1800:  # 30 minutes
+        raise RuntimeError(f"Video too long ({duration_s/60:.1f} min) for TransNetV2")
 
     frames = _extract_frames_small(video_path)
     model = _get_tn2_model()

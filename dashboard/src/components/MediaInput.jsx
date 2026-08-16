@@ -15,6 +15,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [file, setFile] = useState(null);
     const [acknowledged, setAcknowledged] = useState(false);
     const [outputFormat, setOutputFormat] = useState('vertical'); // vertical | horizontal | square
+    const [reframeMode, setReframeMode] = useState('auto'); // auto | track | general
+    const [clipDurationMode, setClipDurationMode] = useState('auto'); // auto | short
     const [showInfo, setShowInfo] = useState(false);
     const infoRef = useRef(null);
 
@@ -59,9 +61,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
         e.preventDefault();
         if (!acknowledged) return;
         if (mode === 'url' && url) {
-            onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat });
+            onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, reframeMode, clipDurationMode });
         } else if (mode === 'file' && file) {
-            onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat });
+            onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, reframeMode, clipDurationMode });
         }
     };
 
@@ -208,6 +210,63 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             );
                         })}
                     </div>
+                </div>
+
+                {/* Reframe mode selector — controls how the crop follows the footage */}
+                <div className="mt-5">
+                    <p className="eyebrow mb-2">Focus / layout</p>
+                    <div className="grid grid-cols-3 gap-2">
+                        {[
+                            { value: 'auto', label: 'Auto', hint: 'Detect per scene' },
+                            { value: 'track', label: 'Follow face', hint: 'Podcasts · talking head' },
+                            { value: 'general', label: 'Full frame', hint: 'Gaming · screen share' },
+                        ].map((r) => {
+                            const active = reframeMode === r.value;
+                            return (
+                                <button
+                                    key={r.value}
+                                    type="button"
+                                    onClick={() => setReframeMode(r.value)}
+                                    className={`py-3 px-2 rounded-input border flex flex-col items-center gap-1 transition-colors
+                                        ${active ? 'border-[color:var(--color-accent)] text-ink' : 'border-rule2 text-muted hover:border-[color:var(--color-accent)]'}`}
+                                >
+                                    <span className="block font-mono text-sm leading-none">{r.label}</span>
+                                    <span className="block text-[10px] leading-tight text-center text-muted">{r.hint}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <p className="readout mt-2">
+                        Gaming or screen recordings? Pick <span className="text-ink2">Full frame</span> so the clip stays on the action instead of zooming onto a facecam.
+                    </p>
+                </div>
+
+                {/* Clip duration selector — controls how long each generated clip is */}
+                <div className="mt-5">
+                    <p className="eyebrow mb-2">Clip length</p>
+                    <div className="grid grid-cols-2 gap-2">
+                        {[
+                            { value: 'auto', label: 'Auto', hint: 'Best viral length · 15–60s' },
+                            { value: 'short', label: 'Shortest', hint: 'As tight as possible · 11–30s' },
+                        ].map((c) => {
+                            const active = clipDurationMode === c.value;
+                            return (
+                                <button
+                                    key={c.value}
+                                    type="button"
+                                    onClick={() => setClipDurationMode(c.value)}
+                                    className={`py-3 px-2 rounded-input border flex flex-col items-center gap-1 transition-colors
+                                        ${active ? 'border-[color:var(--color-accent)] text-ink' : 'border-rule2 text-muted hover:border-[color:var(--color-accent)]'}`}
+                                >
+                                    <span className="block font-mono text-sm leading-none">{c.label}</span>
+                                    <span className="block text-[10px] leading-tight text-center text-muted">{c.hint}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <p className="readout mt-2">
+                        <span className="text-ink2">Shortest</span> trims each clip to the tightest cut that still makes sense — never shorter than 11 seconds.
+                    </p>
                 </div>
 
                 <label className="flex items-start gap-2 mt-5 text-xs text-muted cursor-pointer select-none">

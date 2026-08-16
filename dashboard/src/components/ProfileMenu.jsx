@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { CreditCard, LogOut, Sparkles } from 'lucide-react';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/auth-context';
 
 // Header avatar + dropdown for signed-in cloud users: shows the email and gives
 // access to Account & billing (manage subscription, top-ups) and Sign out.

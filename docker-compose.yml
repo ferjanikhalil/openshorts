@@ -8,6 +8,16 @@ services:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+    environment:
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:5174
+      # Keep transcription memory small on low-RAM hosts (Docker Desktop VM):
+      # 'base' uses ~140MB vs 'small' ~460MB, and capping threads stops
+      # CTranslate2 from spiking memory with per-thread buffers.
+      - WHISPER_MODEL=base
+      - WHISPER_COMPUTE=int8
+      - OMP_NUM_THREADS=2
+      - CLIP_WORKERS=1
+    mem_limit: 5g
     restart: unless-stopped
 
   frontend:

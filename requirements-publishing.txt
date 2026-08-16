@@ -1,0 +1,21 @@
+# Extra dependencies for the automated-publishing subsystem (PUBLISHING_ENABLED).
+#
+# Independent of billing mode — publishing works in self-host too — but it does
+# require Postgres, because duplicate-post prevention, retry state and the audit
+# trail have to survive a redeploy. So it shares the async DB stack.
+#
+# The three DB pins below are deliberately IDENTICAL to requirements-billing.txt
+# so one image can satisfy both subsystems with a single resolved version. Keep
+# them in step when either file is bumped.
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# Not pinned here: alembic. The boot path is `create_all`, so publishing runs
+# without it; the migration in alembic/versions/ is for controlled changes and the
+# Dockerfile installs requirements-billing.txt (which does pin alembic) alongside
+# this file, so `alembic upgrade head` works in the image either way.
+
+# Credential sealing (AES-256-GCM). Only `hazmat.primitives.ciphers.aead.AESGCM`
+# is used — an API stable since cryptography 2.0 — so the pin is for
+# reproducibility, not for a version-specific feature.
+cryptography==44.0.0

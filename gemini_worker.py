@@ -5,11 +5,11 @@ import sys
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types as genai_types
 from pydantic import BaseModel
 
 from clip_selection import lookup_model_prices
+from llm import create_provider
+from llm.base import LLMConfig, LLMResponse
 
 load_dotenv()
 
@@ -87,7 +87,7 @@ VIDEO_DURATION_SECONDS: {video_duration}
 WINDOWS_JSON:
 {windows_json}
 
-Return only:
+OUTPUT FORMAT (strict — the top-level object MUST have exactly one key "windows"):
 {{
   "windows": [
     {{
@@ -99,7 +99,22 @@ Return only:
     }}
   ]
 }}
+Do NOT rename the "windows" key. Do NOT wrap it in another object. Return ONLY the JSON above.
 """
+
+# Clip-length directive injected into DETAIL_PROMPT_TEMPLATE ({duration_directive}).
+# "auto" is the default viral-length behavior; "short" produces the tightest clip
+# that still contains the whole hook->payoff (never shorter than 11s).
+DURATION_DIRECTIVE_AUTO = (
+    "Each clip must be 15 to 60 seconds long, in absolute seconds from the start "
+    "of the source video."
+)
+DURATION_DIRECTIVE_SHORT = (
+    "Make each clip AS SHORT AS POSSIBLE while it stays fully self-contained and "
+    "understandable — it must still open on the hook and end on the payoff. "
+    "NEVER go below 11 seconds and do NOT exceed 30 seconds. Trim any lead-in, "
+    "tangents, or trailing filler. Absolute seconds from the start of the source video."
+)
 
 DETAIL_PROMPT_TEMPLATE = """
 You are a senior short-form video editor and viral copywriter.
@@ -107,7 +122,7 @@ Choose the BEST short clips from these shortlisted candidate windows.
 
 CLIP RULES:
 - Return only valid JSON.
-- Each clip must be 15 to 60 seconds long, in absolute seconds from the start of the source video.
+- {duration_directive}
 - Stay within the candidate window boundaries.
 - THE 2-SECOND RULE: the clip MUST open on its strongest moment. If the first
   2 seconds would not stop a cold viewer from scrolling, move the start or skip the clip.
@@ -138,7 +153,7 @@ VIDEO_DURATION_SECONDS: {video_duration}
 CANDIDATE_WINDOWS_JSON:
 {windows_json}
 
-Return only:
+OUTPUT FORMAT (strict — the top-level object MUST have exactly one key "shorts"):
 {{
   "shorts": [
     {{
@@ -153,6 +168,7 @@ Return only:
     }}
   ]
 }}
+Do NOT rename the "shorts" key. Do NOT wrap it in another object. Return ONLY the JSON above.
 """
 
 
@@ -170,10 +186,16 @@ def _strip_code_fences(text: str) -> str:
 
 def _extract_json_candidate(text: str) -> str:
     cleaned = _strip_code_fences(text)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return cleaned[start:end + 1]
+    first_brace = cleaned.find("{")
+    first_bracket = cleaned.find("[")
+    if first_bracket != -1 and (first_brace == -1 or first_bracket < first_brace):
+        end = cleaned.rfind("]")
+        if end > first_bracket:
+            return cleaned[first_bracket:end + 1]
+    if first_brace != -1:
+        end = cleaned.rfind("}")
+        if end > first_brace:
+            return cleaned[first_brace:end + 1]
     return cleaned
 
 
@@ -194,10 +216,10 @@ def _escape_invalid_unicode_escapes(text: str) -> str:
 
 def _parse_json_response_text(text: str) -> dict:
     if not text:
-        raise ValueError("Gemini returned an empty response body.")
+        raise ValueError("LLM returned an empty response body.")
     candidate = _extract_json_candidate(text).replace("\x00", "").strip()
     if not candidate:
-        raise ValueError("Gemini response did not contain a JSON object.")
+        raise ValueError("LLM response did not contain a JSON object.")
     parse_attempts = [candidate]
     sanitized_candidate = _escape_invalid_unicode_escapes(candidate)
     if sanitized_candidate != candidate:
@@ -208,7 +230,7 @@ def _parse_json_response_text(text: str) -> dict:
             return json.loads(parse_candidate)
         except json.JSONDecodeError as e:
             last_error = e
-    raise ValueError(f"Failed to parse Gemini JSON response: {last_error}")
+    raise ValueError(f"Failed to parse LLM JSON response: {last_error}")
 
 
 def _get_response_text(response) -> str:
@@ -230,19 +252,26 @@ def _get_response_text(response) -> str:
 
 
 def _calculate_cost_analysis(response, model_name: str) -> Optional[dict]:
-    usage = getattr(response, "usage_metadata", None)
-    if not usage:
-        return None
+    """Calculate cost from either a raw Gemini response or an LLMResponse."""
+    if isinstance(response, LLMResponse):
+        prompt_tokens = response.input_tokens
+        output_tokens = response.output_tokens
+        thinking_tokens = response.thinking_tokens
+        if not prompt_tokens and not output_tokens:
+            return None
+    else:
+        usage = getattr(response, "usage_metadata", None)
+        if not usage:
+            return None
+        prompt_tokens = usage.prompt_token_count or 0
+        output_tokens = usage.candidates_token_count or 0
+        thinking_tokens = getattr(usage, "thoughts_token_count", 0) or 0
+
     prices = lookup_model_prices(model_name)
     price_estimated = prices is None
     if prices is None:
-        # Unknown model: conservative estimate so the UI shows something sane.
         prices = (0.50, 3.00)
     input_price_per_million, output_price_per_million = prices
-    prompt_tokens = usage.prompt_token_count or 0
-    output_tokens = usage.candidates_token_count or 0
-    # Thinking tokens bill at the output rate even though they are invisible.
-    thinking_tokens = getattr(usage, "thoughts_token_count", 0) or 0
     input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
     output_cost = ((output_tokens + thinking_tokens) / 1_000_000) * output_price_per_million
     total_cost = input_cost + output_cost
@@ -258,104 +287,63 @@ def _calculate_cost_analysis(response, model_name: str) -> Optional[dict]:
     }
 
 
-def _thinking_config_from_env(model_name: str):
-    """GEMINI_THINKING_SCORE: off (default) | low | high | <token budget>.
-
-    Applied only to the scoring stage. Gemini 3 models take thinking_level,
-    Gemini 2.5 takes thinking_budget; returns None (= model default) if the
-    setting is off or the SDK rejects the config."""
-    raw = (os.getenv("GEMINI_THINKING_SCORE") or "off").strip().lower()
-    if raw in ("", "off", "0", "none", "false"):
-        return None
-    try:
-        if raw.isdigit():
-            return genai_types.ThinkingConfig(thinking_budget=int(raw))
-        if raw in ("low", "high"):
-            if model_name.startswith("gemini-3"):
-                return genai_types.ThinkingConfig(thinking_level=raw)
-            return genai_types.ThinkingConfig(thinking_budget=2048 if raw == "low" else 8192)
-    except Exception as e:
-        _log(f"⚠️ Ignoring GEMINI_THINKING_SCORE={raw!r}: {e}")
-    return None
-
-
-def _config_for_strategy(strategy: str, mode: str, model_name: str) -> genai_types.GenerateContentConfig:
-    # The detail stage writes creative copy (hooks/descriptions) — it gets a
-    # high temperature; timestamps are validated and word-snapped afterwards.
-    # The score stage stays precise. Fallback strategies get conservative.
+def _config_for_strategy(strategy: str, mode: str) -> LLMConfig:
     creative = mode == "detail"
-    kwargs = {
-        "response_mime_type": "application/json",
-        "candidate_count": 1,
-    }
     if strategy == "strict-json":
-        kwargs["temperature"] = 0.7 if creative else 0.1
+        temperature = 0.7 if creative else 0.1
+        schema = None
     elif strategy == "json-text-recovery":
-        kwargs["temperature"] = 0.2 if creative else 0.0
-    else:  # structured-schema: schema-enforced output, primary strategy
-        kwargs["temperature"] = 0.9 if creative else 0.2
-        kwargs["response_schema"] = DetailResponse if mode == "detail" else ScoreResponse
-        if mode == "score":
-            thinking = _thinking_config_from_env(model_name)
-            if thinking is not None:
-                kwargs["thinking_config"] = thinking
-    return genai_types.GenerateContentConfig(**kwargs)
+        temperature = 0.2 if creative else 0.0
+        schema = None
+    else:  # structured-schema
+        temperature = 0.9 if creative else 0.2
+        schema = DetailResponse if mode == "detail" else ScoreResponse
+    return LLMConfig(temperature=temperature, response_schema=schema)
 
 
 def main() -> int:
     _configure_stdio()
 
-    parser = argparse.ArgumentParser(description="Run a single Gemini request for clip scoring/detailing.")
+    parser = argparse.ArgumentParser(description="Run a single LLM request for clip scoring/detailing.")
     parser.add_argument("--mode", choices=["score", "detail"], required=True)
     parser.add_argument("--input", dest="input_path", required=True)
     parser.add_argument("--output", dest="output_path", required=True)
     parser.add_argument("--strategy", default="structured-schema")
-    parser.add_argument("--model", default="gemini-2.5-flash")
+    parser.add_argument("--model", default=None)
     args = parser.parse_args()
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise SystemExit("Missing GEMINI_API_KEY.")
 
     with open(args.input_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    model_name = args.model
-    client = genai.Client(api_key=api_key)
-    config = _config_for_strategy(args.strategy, args.mode, model_name)
+    provider = create_provider(model=args.model)
+    model_name = provider._model if hasattr(provider, '_model') else (args.model or "unknown")
+    config = _config_for_strategy(args.strategy, args.mode)
     language = str(payload.get("language") or "unknown")
 
     template = SCORE_PROMPT_TEMPLATE if args.mode == "score" else DETAIL_PROMPT_TEMPLATE
-    prompt = template.format(
+    format_kwargs = dict(
         video_duration=payload["video_duration"],
         language=language,
         windows_json=json.dumps(payload["windows"], ensure_ascii=False),
     )
+    # The detail template carries a {duration_directive} slot; the score template
+    # does not. Only pass it for detail so score.format() doesn't get an unused key.
+    if args.mode != "score":
+        format_kwargs["duration_directive"] = DURATION_DIRECTIVE_AUTO
+    prompt = template.format(**format_kwargs)
 
-    _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=config,
-    )
+    _log(f"🤖 LLM worker request: mode={args.mode} strategy={args.strategy} provider={provider.provider_name()} model={model_name} items={len(payload.get('windows', []))}")
+    llm_response = provider.generate(prompt, config)
 
-    raw_text = _get_response_text(response)
-    # With response_schema the SDK returns an already-validated object; fall
-    # back to the text-repair path only when that is unavailable.
-    parsed_obj = getattr(response, "parsed", None)
-    if parsed_obj is not None:
-        parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
-    else:
-        parsed = _parse_json_response_text(raw_text)
     result = {
         "mode": args.mode,
-        "payload": parsed,
-        "cost_analysis": _calculate_cost_analysis(response, model_name),
-        "raw_text": raw_text,
+        "payload": llm_response.parsed,
+        "cost_analysis": _calculate_cost_analysis(llm_response, model_name),
+        "raw_text": llm_response.raw_text,
     }
     with open(args.output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    _log(f"✅ Gemini worker success: mode={args.mode}")
+    _log(f"✅ LLM worker success: mode={args.mode}")
     return 0
 
 

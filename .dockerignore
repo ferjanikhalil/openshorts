@@ -35,6 +35,16 @@ dashboard/node_modules/
 *.gif
 videos/
 
+# Runtime data directories — bind-mounted at run time, never needed in the
+# image. Without these the build ships several GB of clips as build context,
+# which is slow enough to look like a hang.
+uploads/
+output/
+outputs/
+temp/
+tmp/
+*.csv
+
 # Model files (downloaded at build time)
 *.pt
 

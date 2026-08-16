@@ -33,8 +33,10 @@ const SIZE_OPTIONS = [
     { value: 'L', label: 'Large' },
 ];
 
-export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles }) {
-    const [text, setText] = useState(initialText || 'POV: You are using the viral hook feature');
+export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles, batchMode = false }) {
+    // In batch mode each clip has its own AI-generated hook, so default to
+    // blank — an empty text tells the backend to use each clip's own hook.
+    const [text, setText] = useState(initialText || (batchMode ? '' : 'POV: You are using the viral hook feature'));
     const [position, setPosition] = useState('top');
     const [size, setSize] = useState('M');
     const [style, setStyle] = useState('classic');
@@ -60,7 +62,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
         switch (position) {
             case 'center': return 'items-center justify-center';
             case 'bottom': return 'items-center justify-end pb-[20%]';
-            case 'top': default: return 'items-center justify-start pt-[20%]';
+            case 'top': default: return 'items-center justify-start pt-[12%]';
         }
     };
 
@@ -120,8 +122,15 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                                 rows={4}
                                 className="input-field resize-none font-serif"
                                 style={{ fontFamily: 'Noto Serif, serif' }}
-                                placeholder="Enter text that will stop the scroll..."
+                                placeholder={batchMode
+                                    ? "Leave blank to use each clip's own AI hook…"
+                                    : "Enter text that will stop the scroll..."}
                             />
+                            {batchMode && (
+                                <p className="text-[11px] text-muted mt-1.5">
+                                    Blank = every clip keeps its own generated hook. Type here only to force the same text on all clips.
+                                </p>
+                            )}
                         </div>
 
                         {/* Style (new) */}
@@ -219,7 +228,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, isProcessing, v
                                 // Remotion data
                                 remotion: hookConfig,
                             })}
-                            disabled={isProcessing || !text.trim()}
+                            disabled={isProcessing || (!batchMode && !text.trim())}
                             className="btn-primary flex-1"
                         >
                             {isProcessing && <Loader2 size={16} className="animate-spin text-brassink" />}

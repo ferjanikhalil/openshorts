@@ -1,11 +1,6 @@
 import React, { useState } from 'react';
 import Modal from './ui/Modal';
-
-const DISMISS_KEY = 'os_watermark_notice_dismissed';
-
-export function watermarkNoticeDismissed() {
-  try { return localStorage.getItem(DISMISS_KEY) === '1'; } catch { return false; }
-}
+import { dismissWatermarkNotice } from '../lib/watermark';
 
 // Shown to free users before their first download: the clip carries a
 // watermark, and upgrading removes it. Dismissible for good, like OpusClip's.
@@ -14,7 +9,7 @@ export default function WatermarkModal({ onClose, onContinue }) {
 
   const close = (proceed) => {
     if (dontShow) {
-      try { localStorage.setItem(DISMISS_KEY, '1'); } catch { /* ignore */ }
+      dismissWatermarkNotice();
     }
     if (proceed) onContinue?.();
     onClose();

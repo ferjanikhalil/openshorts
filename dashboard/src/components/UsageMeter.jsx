@@ -1,6 +1,6 @@
 import React from 'react';
 import { Zap } from 'lucide-react';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/auth-context';
 
 // Compact minutes-remaining pill for the header (managed users only).
 export default function UsageMeter({ onClick }) {

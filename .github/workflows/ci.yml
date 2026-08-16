@@ -17,9 +17,12 @@ jobs:
       # and the cloud metering helpers), so we install just what they import
       # instead of the full requirements.txt (faster-whisper/ultralytics/
       # mediapipe are too heavy for CI). sqlalchemy is needed because
-      # tests/test_metering_free_plan.py imports cloud.metering.
+      # tests/test_metering_free_plan.py imports cloud.metering; cryptography
+      # because tests/test_publishing_crypto.py exercises credential sealing.
+      # The publishing tests need no Postgres and no credential — the provider
+      # suite runs against httpx.MockTransport and the in-repo fake adapter.
       - name: Install test dependencies
-        run: pip install pytest pillow httpx pydantic sqlalchemy
+        run: pip install pytest pillow httpx pydantic sqlalchemy cryptography
       - name: Run tests
         run: pytest tests/ -v
 
