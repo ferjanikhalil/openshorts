@@ -12,6 +12,21 @@ side document:
     (both 401 unauthenticated, i.e. present and auth-gated).
     Consequence: ``supports_status_lookup=False``,
     ``supports_cancel_scheduled=False``, ``supports_account_listing=False``.
+
+    **Lead closed (2026-08-19), negatively.** Those ``/v1/...`` paths are
+    *display* paths: the real base is
+    ``https://app.status200uploads.com/functions/v1``, where the routes are
+    ``api-posts`` and ``api-media-upload`` — a different HOST from the
+    ``status200uploads.com/api/v2`` this adapter uses. That made the old 405s
+    suspect, since they were GETs against a POST-only function, and a submit
+    response then named an operation outright: "Poll action check_job_status".
+    Both hosts were then probed properly — POST, with the action in the query
+    string and in the body, including a real ``job_id``. Every probe answered
+    ``400 Missing 'post' object``. There is no ``action`` dispatch and no second
+    endpoint: one handler, and all it does is create posts. That settles three
+    things at once — no status lookup, no cancel, and nowhere else that
+    ``scheduledFor`` might be honoured. ``probe_endpoints`` established this and
+    is the tool for re-establishing it when their API changes.
   * **CORS is not a method list.** ``api-posts`` advertises
     ``GET, POST, PUT, DELETE, OPTIONS``, but that is a permissive Supabase
     default; v2 correctly advertises only ``POST, OPTIONS``. The 405s are the
@@ -56,9 +71,10 @@ import httpx
 
 from .. import platforms as plat
 from ..errors import (
-    E_AUTH, E_MEDIA_TOO_LARGE, E_MEDIA_UNFETCHABLE, E_NETWORK, E_NOT_CONNECTED,
-    E_PROVIDER_5XX, E_QUOTA_EXHAUSTED, E_RATE_LIMITED, E_TIMEOUT, E_UNKNOWN,
-    E_VALIDATION, ProviderError, classify_http_status,
+    E_ACCOUNT_AUTH, E_AUTH, E_MEDIA_TOO_LARGE, E_MEDIA_UNFETCHABLE, E_NETWORK,
+    E_NOT_CONNECTED, E_PROVIDER_5XX, E_QUOTA_EXHAUSTED, E_RATE_LIMITED,
+    E_REMOTE_SCHEDULE, E_TIMEOUT, E_UNKNOWN, E_VALIDATION, ProviderError,
+    classify_http_status,
 )
 from .base import (
     Capabilities, MediaRef, PublishPayload, SubmitResult, WebhookEvent,
@@ -68,8 +84,28 @@ BASE_URL = "https://status200uploads.com/api/v2"
 MEDIA_ENDPOINT = f"{BASE_URL}/media"
 POSTS_ENDPOINT = f"{BASE_URL}/posts"
 
+# The v1 API is a Supabase edge function on a DIFFERENT HOST, and it is the one
+# whose docs actually document ``post.scheduledFor`` — every scheduling example
+# targets this URL. The paths in those docs (``POST /v1/posts``,
+# ``GET /v1/profiles``) are display names for actions on this single function,
+# which is why probing them as REST paths returned 405. Used by
+# ``probe_endpoints``; see it for why scheduled traffic may have to move here.
+V1_BASE_URL = "https://app.status200uploads.com/functions/v1"
+V1_POSTS_ENDPOINT = f"{V1_BASE_URL}/api-posts"
+
 # Provider media refs expire after 7 days.
 MEDIA_TTL_SECONDS = 7 * 24 * 3600
+
+# Statuses that mean the upload is already moving. Taken from live responses on
+# 2026-08-18, where two posts that had asked for a slot 2.5h out came back as
+#   {"data": {"job_id": "...", "status": "processing",
+#             "message": "YouTube upload started in the background. ..."}}
+#   {"data": {"status": "processing", "post_id": "...", "publish_id": "..."}}
+# Not one of these describes a parked post, so seeing any of them in answer to a
+# future slot means the slot was dropped. "published" alone is NOT enough — see
+# the detector in ``submit``.
+GOING_OUT_NOW = ("published", "processing", "posting", "publishing",
+                 "uploading", "in_progress", "live")
 
 # The provider requires a webhook ack within ~5s, so our own outbound calls get a
 # generous but bounded timeout: a submit that hangs forever holds a worker slot
@@ -85,12 +121,106 @@ CAPABILITIES = Capabilities(
     media_ref_ttl_seconds=MEDIA_TTL_SECONDS,
     # All three False by probe, not by assumption — see the module docstring.
     supports_status_lookup=False,
+    # False, and this one was expensive to establish. Their docs document
+    # ``post.scheduledFor`` (v1.4.0 2026-04) as an "ISO 8601 timestamp to
+    # schedule the post for a future time". It is not honoured. The evidence,
+    # gathered over three real posts:
+    #
+    #   2026-08-18 14:18Z  slot 17:00Z, sent as ``2026-08-18T17:00:00+00:00``
+    #                      -> 200 ``processing``, live within minutes.
+    #   2026-08-18 22:22Z  same slot logic, sent in the documented shape
+    #                      ``...T00:00:00.000Z`` -> 200 ``processing``, live
+    #                      within minutes. So the format was never the cause.
+    #   2026-08-19         POST to BOTH hosts (v2 ``/api/v2/posts`` and the v1
+    #                      edge function every scheduling example in the docs
+    #                      targets) answers ``Missing 'post' object`` -- one
+    #                      handler, no ``action`` dispatch, no second endpoint
+    #                      where scheduling might live.
+    #
+    # A held slot has a documented shape we have never once seen: 202 with
+    # ``scheduled_at`` and ``scheduled_post_id``. We only ever get 200
+    # ``processing``. Treat the field as accepted-and-discarded.
+    #
+    # Consequence, and the reason this flag matters more than it looks: at True
+    # the orchestrator hands the timestamp over and releases the attempt for
+    # immediate submit, so a spaced-out plan fires all at once. At False every
+    # slot is held by OUR clock, which spaces correctly but requires this process
+    # to be running when a slot arrives. Nothing free can make Status 200 hold a
+    # clock; only an always-on host can remove that requirement.
+    #
+    # The ``schedule_ignored`` detector in ``submit`` stays, for the day this
+    # (or another provider) claims support again: it compares intent against
+    # outcome and disables hand-over after ONE post rather than a day's worth.
     supports_remote_schedule=False,
     supports_cancel_scheduled=False,
     supports_account_listing=False,
     supports_webhooks=True,
     one_platform_per_request=True,
 )
+
+# Process-lifetime health of the remote-schedule field. Flipped off by the
+# dispatcher the first time the live API rejects ``scheduledFor``; read by the
+# promote pass so scheduled posts stop being handed over early.
+_remote_schedule_ok = True
+
+
+def remote_schedule_available() -> bool:
+    return _remote_schedule_ok
+
+
+def remote_schedule_disable(reason: str) -> None:
+    global _remote_schedule_ok
+    if _remote_schedule_ok:
+        _remote_schedule_ok = False
+        print("⚠️  Publishing: Status 200 did not honour the scheduledFor field "
+              f"({reason}); falling back to local-clock scheduling for this "
+              "process.")
+
+
+def _iso_z(dt: datetime) -> str:
+    """The exact timestamp shape this API's own examples use.
+
+    ``datetime.isoformat()`` on a UTC-aware value yields ``+00:00``, which reads
+    as valid ISO 8601 to a human and as a validation failure to the JS validator
+    on the other end (``z.string().datetime()`` accepts only ``Z`` unless the
+    offset option is set). On an optional field that failure is silent: the key
+    is dropped and the post publishes now. So emit what their docs and their own
+    messages emit — UTC, millisecond precision, literal ``Z``:
+
+        2026-08-18T17:00:00.000Z
+
+    Naive input is treated as UTC; anything else is converted, so a caller
+    passing a local-offset datetime cannot shift the slot.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}.{dt.microsecond // 1000:03d}Z"
+
+
+def _envelope_get(body: dict, *keys):
+    """Read a key from the response, whether or not it is wrapped.
+
+    The REQUEST is wrapped (``{"post": {...}}``), and the response is wrapped
+    too — confirmed on 2026-08-18 against stored responses, which are all
+    ``{"data": {...}}`` (TikTok adds a sibling ``{"error": {"code": "ok"}}``).
+    A flat lookup against a wrapped body silently returns None, which is why
+    ``provider_post_ref`` came back null on every submit; a null ref cannot be
+    matched to an inbound webhook, so every post aged into ``unknown`` while
+    being perfectly live. Look at the top level first, then inside the usual
+    envelopes.
+    """
+    scopes = [body]
+    for env in ("post", "data", "result", "scheduled_post"):
+        inner = body.get(env)
+        if isinstance(inner, dict):
+            scopes.append(inner)
+    for scope in scopes:
+        for key in keys:
+            val = scope.get(key)
+            if val not in (None, ""):
+                return val
+    return None
 
 
 def _headers(api_key: str) -> dict:
@@ -204,6 +334,69 @@ def _is_provider_json(body: dict) -> bool:
     return bool(body) and "_raw_text" not in body
 
 
+def _mentions_scheduled_for(resp: httpx.Response, body: dict) -> bool:
+    """Did the provider refuse the FIELD rather than the post?
+
+    Checked only on 4xx responses to a submit that carried ``scheduledFor``.
+    Looks at the field names of the error body (validation frameworks echo the
+    offending key) and at the message text.
+    """
+    haystack = " ".join(
+        str(k) for k in body.keys()) + " " + (resp.text or "")
+    return "scheduledfor" in haystack.lower().replace("_", "").replace("-", "")
+
+
+# A 401 from this provider answers two completely different questions, and the
+# body is the only thing that tells them apart:
+#
+#   * "your API key is not valid"           -> the group cannot publish at all
+#   * "this account's platform token died"  -> ONE account must be re-linked
+#
+# Observed live (2026-08-17): submitting to Instagram returned 401 with
+# "Instagram can no longer refresh this token (Error validating access token:
+# Session has expired ...). Please reconnect your Instagram account." Reading that
+# as a key problem marked the group's credential invalid, and every subsequent
+# post — YouTube and TikTok included — parked on "no usable API key" forever.
+#
+# The check below is deliberately one-sided: only strong evidence routes away
+# from E_AUTH, because being wrong in that direction blocks one destination,
+# while being wrong in the other direction blocks the entire group.
+_REAUTH_INSTRUCTIONS = (
+    "reconnect", "re-connect", "reauthenticate", "re-authenticate",
+    "reauthorize", "re-authorize", "reauthorise", "link the account again",
+    "connect the account again", "log in again", "login again",
+)
+# Expiry wording. On its own this is NOT enough — "token expired" is also how a
+# provider describes a dead API key — so it counts only alongside the name of a
+# social platform, which an API-key rejection has no reason to mention.
+_TOKEN_EXPIRY_WORDS = (
+    "session has expired", "session expired", "access token",
+    "refresh this token", "token has expired", "token expired",
+    "expired token", "token is invalid or expired",
+)
+
+
+# Platform names an account-level failure has reason to mention. Wider than this
+# adapter's own three platforms on purpose: Instagram tokens are issued by
+# Facebook, so the live message names a platform we never publish to. Kept to
+# proper platform names only — loose words like "account" appear in API-key
+# rejections too ("invalid API token for this account") and would misroute them.
+_ACCOUNT_WORDS = tuple(plat.KNOWN_PLATFORMS) + (
+    "facebook", "meta", "google", "shorts", "reels",
+)
+
+
+def _is_account_auth_error(lowered: str) -> bool:
+    """Is this 401 about a connected ACCOUNT rather than about the API key?"""
+    if any(w in lowered for w in _REAUTH_INSTRUCTIONS):
+        return True
+    if any(w in lowered for w in _TOKEN_EXPIRY_WORDS):
+        # A key rejection has no account to talk about, so naming one is the
+        # tell. "invalid api token" stays E_AUTH; "instagram token expired"
+        # does not.
+        return any(w in lowered for w in _ACCOUNT_WORDS)
+    return False
+
 def _submit_transport_error(exc: httpx.HTTPError) -> ProviderError:
     """Classify a submit that never produced a response.
 
@@ -254,6 +447,14 @@ def _classify(resp: httpx.Response, body: dict, *,
         return ProviderError(E_NOT_CONNECTED, msg, status_code=status,
                              response=body)
     if status == 401:
+        # Match against the whole body, not just the extracted message: the
+        # account-level detail has been seen nested under a field _message does
+        # not read, and missing it is the expensive direction.
+        if _is_account_auth_error(f"{lowered} {(resp.text or '')[:2000].lower()}"):
+            # The KEY worked; the account behind this destination did not. Only
+            # this destination is affected — see _is_account_auth_error.
+            return ProviderError(E_ACCOUNT_AUTH, msg, status_code=status,
+                                 response=body)
         return ProviderError(E_AUTH, msg, status_code=status, response=body)
     if status == 413:
         return ProviderError(E_MEDIA_TOO_LARGE, msg, status_code=status,
@@ -287,6 +488,13 @@ class Status200Provider:
     """Stateless adapter. One instance is shared; no credential is retained."""
 
     capabilities = CAPABILITIES
+
+    def remote_schedule_ok(self) -> bool:
+        """Live health of the ``scheduledFor`` field for this process."""
+        return remote_schedule_available()
+
+    def disable_remote_schedule(self, reason: str) -> None:
+        remote_schedule_disable(reason)
 
     async def upload_media(self, api_key: str, *, media_url: str,
                            mime_type: Optional[str] = None) -> MediaRef:
@@ -349,10 +557,20 @@ class Status200Provider:
             "platform": platform,
             "content": content,
         }
-        # Remote scheduling is unsupported (no cancel endpoint), so
-        # scheduled_for is deliberately NOT forwarded — the dispatcher holds the
-        # clock locally and submits at the appointed time. Sending it would create
-        # a post we could not recall.
+        # Remote scheduling: when the orchestrator hands a FUTURE timestamp the
+        # post is submitted now and the provider publishes at the appointed
+        # time — the machine does not need to be awake at the slot.
+        #
+        # The value goes through _iso_z, not isoformat(). That is the whole
+        # difference between a scheduled post and one that publishes instantly:
+        # a `+00:00` offset is dropped by the validator on the other side without
+        # an error. Two failure modes, both handled:
+        #   * 4xx naming the field  -> E_REMOTE_SCHEDULE, nothing was created,
+        #     the dispatcher retries on the local clock.
+        #   * accepted but ignored  -> detected after the fact from the response
+        #     (schedule_ignored below); the post is live and stays live.
+        if payload.scheduled_for is not None:
+            post["scheduledFor"] = _iso_z(payload.scheduled_for)
         options = dict(payload.options or {})
         if payload.title and platform == plat.YOUTUBE:
             options.setdefault("title", payload.title)
@@ -401,16 +619,54 @@ class Status200Provider:
             )
 
         if resp.status_code >= 400:
+            if (400 <= resp.status_code < 500
+                    and payload.scheduled_for is not None
+                    and _mentions_scheduled_for(resp, body)):
+                # The field itself was refused — the docs' scheduling support is
+                # not live on this endpoint. A 4xx means no post was created,
+                # so the caller may safely retry on the local clock.
+                raise ProviderError(
+                    E_REMOTE_SCHEDULE,
+                    f"HTTP {resp.status_code}: the provider rejected the "
+                    f"scheduledFor field: {_message(body, 'unsupported')}",
+                    status_code=resp.status_code, response=body)
             err = _classify(resp, body, submit=True)
             if err.code == E_QUOTA_EXHAUSTED:
                 err.response = {**body, "_quota": _serialize_quota(quota)}
             raise err
 
-        post_ref = (body.get("post_id") or body.get("postId")
-                    or body.get("id") or body.get("scheduled_post_id"))
-        provider_status = str(body.get("status") or "").lower()
-        native_ref = (body.get("platform_post_id") or body.get("native_post_id")
-                      or body.get("platformPostId"))
+        # ``job_id`` last, and it matters that it is present at all: a YouTube
+        # submit returns ONLY a job_id (no post_id), so without it every YouTube
+        # post carried a null ref, could never be matched to a webhook, and aged
+        # into ``unknown`` at the submit timeout. TikTok returns post_id, which
+        # is the better handle, so ordering decides when both exist.
+        post_ref = _envelope_get(body, "post_id", "postId", "id",
+                                 "scheduled_post_id", "scheduledPostId",
+                                 "job_id", "jobId")
+        provider_status = str(_envelope_get(body, "status") or "").lower()
+        native_ref = _envelope_get(body, "platform_post_id", "native_post_id",
+                                   "platformPostId", "publish_id", "publishId")
+
+        # Did the provider actually take the slot? Only asked when we asked for
+        # one. This fires on any status that means the upload is already moving,
+        # not just "published": the first version of this check tested for
+        # "published" alone and so would have stayed silent through the very
+        # incident it exists to catch — the real answer was "processing", with
+        # the message "YouTube upload started in the background".
+        #
+        # An echoed timestamp is the one positive proof that the slot WAS taken,
+        # so it overrides the status. Absent that, err toward flagging: a false
+        # positive costs one logged event and a fall back to the local clock,
+        # while a false negative costs a whole plan published at once.
+        schedule_echo = _envelope_get(body, "scheduledFor", "scheduled_for",
+                                      "scheduled_at", "publish_at")
+        schedule_ignored = False
+        if (payload.scheduled_for is not None and schedule_echo is None
+                and provider_status in GOING_OUT_NOW):
+            schedule_ignored = True
+            remote_schedule_disable(
+                f"asked for {_iso_z(payload.scheduled_for)}, response says "
+                f"{provider_status!r}: {_message(body, 'no detail given')}")
 
         if provider_status == "published":
             status = "succeeded"
@@ -431,21 +687,98 @@ class Status200Provider:
             status=status,
             provider_post_ref=str(post_ref) if post_ref else None,
             provider_native_post_ref=str(native_ref) if native_ref else None,
-            permalink=body.get("permalink") or body.get("url"),
+            permalink=_envelope_get(body, "permalink", "url"),
             quota=quota,
             raw=body,
+            schedule_ignored=schedule_ignored,
         )
 
     async def fetch_status(self, api_key: str,
                            provider_post_ref: str) -> Optional[SubmitResult]:
-        """Unsupported: every documented lookup route returned 405 on probe.
+        """Genuinely unsupported — measured twice, the second time properly.
 
-        Returning None (rather than raising) lets the reconciler treat "no
-        polling available" as a normal condition and fall back to the stale
-        sweeper. If the provider ships a lookup endpoint later, this method and
-        ``supports_status_lookup`` are the only things that change.
+        The first measurement (GET on ``/v1/posts/{id}`` and friends -> 405) was
+        bad: those are display paths in the docs, and the function behind them
+        only accepts POST, so the probe measured the verb rather than the feature.
+        A submit response then handed us a real lead, verbatim: "Poll action
+        check_job_status or check post history."
+
+        Re-probed properly on 2026-08-19 — POST, ``{"action": "check_job_status",
+        "job_id": ...}`` with a real job id, against both the v2 endpoint and the
+        v1 edge function. Both answered ``400 Missing 'post' object``. There is no
+        ``action`` dispatch on either host: the handler creates posts and does
+        nothing else. Whatever ``check_job_status`` belongs to, it is not reachable
+        from this API surface.
+
+        So completion depends on inbound webhooks, and an unconfirmed post ages
+        into ``unknown`` for a human. If a real lookup ever appears, this method
+        and ``supports_status_lookup`` are the only things that change; the
+        reconciler already handles both cases. ``probe_endpoints`` is the tool for
+        re-measuring — cheaply, and without publishing anything.
+
+        Returning None (rather than raising) lets the reconciler treat "no polling
+        available" as a normal condition and fall back to the stale sweeper.
         """
         return None
+
+    async def probe_endpoints(self, api_key: str,
+                              job_ref: Optional[str] = None) -> list:
+        """Read-only reconnaissance. Publishes nothing.
+
+        This exists because the docs and this API disagree in ways that have
+        already cost real posts. ``scheduledFor`` is documented under
+        ``POST /v1/posts``, and every scheduling example in those docs targets
+        the edge function ``V1_POSTS_ENDPOINT`` below — a DIFFERENT HOST from the
+        v2 endpoint we submit to. The v2 section claims only that the same JSON
+        body works for more platforms; it never claims ``scheduledFor`` is
+        honoured, and measurement says it is not: on 2026-08-18, two posts
+        carrying a correctly-formatted ``...000Z`` timestamp came back 200
+        ``processing`` and went out immediately. A held slot looks different in
+        the docs — 202 with ``scheduled_at`` and ``scheduled_post_id``.
+
+        Measured 2026-08-19: **GET is 405 on both hosts**, with v1 answering in
+        its own error envelope (``{"error":{"code":"api_error"}}``) rather than
+        v2's, i.e. the v1 function is live and simply POST-only. This is what
+        invalidates the old ``supports_status_lookup=False``: those probes were
+        GETs against a function that only accepts POST, so they measured the verb
+        and not the feature.
+
+        Every probe below is safe. An action probe carries no media, no platform
+        and no caption, so the worst a misread ``action`` can do is fail
+        validation — there is nothing there to publish.
+        """
+        probes = [
+            ("v1 action in query", "POST",
+             f"{V1_POSTS_ENDPOINT}?action=platforms", {}),
+            ("v1 action in body", "POST", V1_POSTS_ENDPOINT,
+             {"action": "platforms"}),
+            ("v2 action in body", "POST", POSTS_ENDPOINT,
+             {"action": "platforms"}),
+        ]
+        if job_ref:
+            # The lead the provider handed us verbatim: "Poll action
+            # check_job_status". If this answers, polling replaces webhooks as
+            # the completion signal and `unknown` stops needing a human.
+            probes += [
+                ("v1 check_job_status", "POST", V1_POSTS_ENDPOINT,
+                 {"action": "check_job_status", "job_id": job_ref}),
+                ("v2 check_job_status", "POST", POSTS_ENDPOINT,
+                 {"action": "check_job_status", "job_id": job_ref}),
+            ]
+        out = []
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0),
+                                     follow_redirects=True) as client:
+            for label, verb, url, body in probes:
+                entry = {"label": label, "url": url, "sent": body}
+                try:
+                    resp = await client.request(verb, url, json=body,
+                                                headers=_headers(api_key))
+                    entry["http_status"] = resp.status_code
+                    entry["body"] = resp.text[:600]
+                except Exception as e:
+                    entry["error"] = f"{type(e).__name__}: {e}"
+                out.append(entry)
+        return out
 
     def parse_webhook(self, payload: dict) -> WebhookEvent:
         """Normalize the ``{id, type, created_at, data}`` envelope."""
@@ -465,10 +798,11 @@ class Status200Provider:
             event_id=str(payload.get("id") or ""),
             event_type=event_type,
             provider_post_ref=_first_str(data, "post_id", "postId", "id",
-                                         "scheduled_post_id"),
+                                         "scheduled_post_id", "job_id"),
             provider_native_post_ref=_first_str(data, "platform_post_id",
                                                 "native_post_id",
-                                                "platformPostId"),
+                                                "platformPostId",
+                                                "publish_id"),
             provider_account_ref=_first_str(data, "accountId", "account_id",
                                             "profile", "profile_username"),
             permalink=_first_str(data, "permalink", "url", "post_url"),

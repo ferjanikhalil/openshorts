@@ -1,0 +1,45 @@
+# Cloudflare Worker that keeps the publishing Space awake.
+#
+#   npx wrangler deploy          # from this directory
+#   npx wrangler tail            # live logs
+#
+# Free plan, no credit card: 100,000 requests/day and 5 cron triggers. This uses
+# one trigger and ~4,300 requests a month.
+
+name = "openshorts-publisher-heartbeat"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+# Ten minutes is far more often than the Space's idle timeout requires. The
+# interval is set by how fast you want to hear that the publisher died, not by
+# how fast it falls asleep.
+[triggers]
+crons = ["*/10 * * * *"]
+
+[vars]
+# The Space's health endpoint. Not a secret — it is a public URL, since the
+# provider's webhook has to reach the same host.
+HEARTBEAT_URL = "https://<hf-username>-openshorts-publisher.hf.space/api/publishing/health"
+# How long to wait for a response before calling the tick a failure. A waking
+# Space can exceed this; that is expected and is why an alert needs two
+# consecutive failures.
+TIMEOUT_MS = "25000"
+
+# Telegram alerting. Secrets, NOT vars — set them out of band so they never enter
+# this file or your shell history:
+#     npx wrangler secret put TELEGRAM_BOT_TOKEN
+#     npx wrangler secret put TELEGRAM_CHAT_ID
+# Same bot and chat as the app's own alerts (cloud/alerts.py). Leave them unset
+# and the worker still keeps the Space awake; it just logs instead of notifying.
+
+# Optional but recommended: one KV namespace, used only to remember whether you
+# have already been told about the current outage. Without it the worker falls
+# back to at most one alert per hour; with it you get exactly one alert when the
+# publisher goes down and one when it comes back.
+#
+#     npx wrangler kv namespace create HEARTBEAT_STATE
+#
+# then uncomment these two lines and paste the id it prints.
+# [[kv_namespaces]]
+# binding = "STATE"
+# id = "<paste the id from the command above>"

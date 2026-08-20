@@ -12,8 +12,9 @@
 # are durability requirements, and a guard that forgets on redeploy is not one.
 #
 # NO PROVIDER API KEY APPEARS HERE. Status 200 keys are entered through the admin
-# UI, sealed with AES-256-GCM and never returned to the frontend. The only secret
-# in this file is the master key that wraps them, and it comes from the host env.
+# UI, sealed with AES-256-GCM and never returned to the frontend. The secrets this
+# file names — the master key that wraps them, and the media-store keys — are
+# referenced from the host env and have no literal value here.
 services:
   db:
     image: postgres:16-alpine
@@ -52,6 +53,20 @@ services:
       # A localhost value cannot work: Status 200 has to reach it from outside.
       - PUBLISHING_PUBLIC_BASE_URL=${PUBLISHING_PUBLIC_BASE_URL:-}
       - PUBLISHING_MEDIA_URL_TTL=${PUBLISHING_MEDIA_URL_TTL:-3600}
+      # Media staging. With these set, clips are copied to an S3-compatible
+      # bucket in the background and the provider is handed a presigned GET, so
+      # the provider's download never has to cross this machine's uplink inside
+      # its submit window. Unset = the signed-token route, served from here.
+      - PUBLISHING_S3_ENDPOINT=${PUBLISHING_S3_ENDPOINT:-}
+      - PUBLISHING_S3_BUCKET=${PUBLISHING_S3_BUCKET:-}
+      - PUBLISHING_S3_REGION=${PUBLISHING_S3_REGION:-}
+      - PUBLISHING_S3_ACCESS_KEY_ID=${PUBLISHING_S3_ACCESS_KEY_ID:-}
+      - PUBLISHING_S3_SECRET_ACCESS_KEY=${PUBLISHING_S3_SECRET_ACCESS_KEY:-}
+      - PUBLISHING_STORE_RETENTION_HOURS=${PUBLISHING_STORE_RETENTION_HOURS:-48}
+      # The provider keeps the media URL and downloads from it at POST time, which
+      # for a scheduled post is days later — hence a lifetime measured in days,
+      # not the short one above.
+      - PUBLISHING_PROVIDER_MEDIA_URL_TTL=${PUBLISHING_PROVIDER_MEDIA_URL_TTL:-604800}
       # Defaults to ON here on purpose. The full pipeline runs against the in-repo
       # fake provider, so a first `up` cannot post to a real account by accident.
       # Set PUBLISHING_DRY_RUN=false in the host env when you are ready.
@@ -61,9 +76,14 @@ services:
       - PUBLISHING_MAX_ATTEMPTS=${PUBLISHING_MAX_ATTEMPTS:-5}
       - PUBLISHING_DISPATCH_INTERVAL=${PUBLISHING_DISPATCH_INTERVAL:-5}
       - PUBLISHING_RECONCILE_INTERVAL=${PUBLISHING_RECONCILE_INTERVAL:-60}
+      - PUBLISHING_TRANSFER_INTERVAL=${PUBLISHING_TRANSFER_INTERVAL:-15}
       - PUBLISHING_SUBMIT_TIMEOUT=${PUBLISHING_SUBMIT_TIMEOUT:-1800}
       - PUBLISHING_MAX_CONCURRENT_UPLOADS=${PUBLISHING_MAX_CONCURRENT_UPLOADS:-4}
       - PUBLISHING_PER_CREDENTIAL_CONCURRENCY=${PUBLISHING_PER_CREDENTIAL_CONCURRENCY:-1}
+      # Who holds the clock for a scheduled post. `auto` hands the timestamp to
+      # Status 200 (this machine may then be off at the slot); `off` keeps the
+      # clock here, which means the container must be running when a slot lands.
+      - PUBLISHING_REMOTE_SCHEDULE=${PUBLISHING_REMOTE_SCHEDULE:-auto}
 
 volumes:
   pgdata:

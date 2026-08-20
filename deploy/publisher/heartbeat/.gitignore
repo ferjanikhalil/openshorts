@@ -1,0 +1,10 @@
+# `node_modules` is ignored by dashboard/.gitignore, which is scoped to that
+# directory — so this file is what keeps a local `npm i wrangler` out of the
+# repository. It matters more than usual here: the repo is public, and the runbook's
+# Step 0 says `git add -A`.
+node_modules/
+package-lock.json
+
+# Wrangler's local state and dev cache.
+.wrangler/
+.dev.vars

@@ -27,6 +27,7 @@ import asyncio
 import base64
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -47,6 +48,10 @@ os.environ.update(
     PUBLISHING_DRY_RUN="1",
     PUBLISHING_MASTER_KEY=MASTER_KEY,
     PUBLISHING_PUBLIC_BASE_URL="https://clips.test.invalid",
+    # The pacer's transfer gap is real protection in production and pure
+    # slowness here: many tests register media back to back. It has its own
+    # dedicated test below with the gap set explicitly.
+    PUBLISHING_MEDIA_REGISTRATION_GAP="0",
     DATABASE_URL=DB_URL,
 )
 
@@ -56,6 +61,7 @@ from cloud import database as cloud_db  # noqa: E402
 from publishing import clips, crypto, dispatcher, planner, service, state  # noqa: E402
 from publishing import db as pdb  # noqa: E402
 from publishing import models as m  # noqa: E402
+from publishing.config import ORPHAN_CLAIM_MIN_AGE_SECONDS  # noqa: E402
 from publishing.providers import fake  # noqa: E402
 
 _LOOP = asyncio.new_event_loop()
@@ -450,7 +456,52 @@ class TestFailureModes:
             assert len(fake.submissions) == 1
         run(go())
 
-    def test_a_202_parks_the_post_as_submitted_instead_of_failing(self):
+    def test_an_account_401_disconnects_that_destination_only(self):
+        # The 2026-08-17 regression, end to end. One connected account's platform
+        # token expires; the provider answers 401. Before the fix that 401 was
+        # read as "bad API key", the group's credential was invalidated, and the
+        # two healthy platforms then parked every post every 15 minutes forever.
+        async def go():
+            gid, dest_ids = await _group(name="acct-auth")
+            bad_id = dest_ids[1]
+            # Scope the failure to ONE destination: _marker() reads the account
+            # ref, so only this platform's submit raises — exactly like a single
+            # expired token at the provider.
+            async with pdb.session() as s:
+                d = await s.get(m.PublishDestination, bad_id)
+                d.provider_account_ref = "acct_fail-account-auth"
+                await s.commit()
+
+            req_id, _ = await _publish("job-m2", 0, dest_ids)
+            await _drain()
+
+            async with pdb.session() as s:
+                cred = (await s.execute(select(m.PublishCredential).where(
+                    m.PublishCredential.publish_group_id == gid
+                ))).scalar_one()
+                # THE guard: one account's dead token must not disable the key.
+                assert cred.invalid_at is None
+                bad = await s.get(m.PublishDestination, bad_id)
+                assert bad.health == "disconnected"
+                assert bad.health_detail
+                others = [await s.get(m.PublishDestination, i)
+                          for i in dest_ids if i != bad_id]
+                assert all(o.health == "ok" for o in others)
+
+            rows = await _attempts(req_id)
+            # Destination-fatal, so BLOCKED and no retry row — but only for the
+            # one destination whose token died.
+            blocked = [r for r in rows if r.status == state.BLOCKED]
+            assert len(blocked) == 1
+            assert blocked[0].error_code == "account_reauth_required"
+            assert blocked[0].publish_destination_id == bad_id
+            assert len(rows) == 3, "a destination-fatal error creates no retry"
+            # The other two really published; nothing deferred, nothing parked.
+            assert sum(r.status == state.SUCCEEDED for r in rows) == 2
+            assert not [r for r in rows if r.status == state.DEFERRED]
+        run(go())
+
+
         # The provider parked the post (daily cap reached): the post EXISTS on
         # their side, so the row must be `submitted` with a window, NOT deferred —
         # a deferred row gets re-claimed and re-submitted at timer expiry, which
@@ -691,7 +742,24 @@ class TestPartialAndReconciliation:
                 attempts = await service.claim_due_attempts(s, "dead-worker")
                 assert len(attempts) == 1
                 await s.commit()
-            # The worker is killed here, leaving the row in_flight forever.
+
+            # A claim made a moment ago is NOT an orphan. Two processes share
+            # this queue — the app host and the always-on publisher — so a
+            # recovery pass regularly runs while the other one is mid-batch, and
+            # re-queuing a claim someone is still working through is how one clip
+            # becomes two posts.
+            async with pdb.session() as s:
+                assert await service.recover_orphaned_claims(s) == 0
+                await s.commit()
+
+            # Age the claim past the bound: now the worker really is gone.
+            async with pdb.session() as s:
+                rows = await _attempts(req_id)
+                attempt = await s.get(m.PublishAttempt, rows[-1].id)
+                attempt.claimed_at = (
+                    datetime.now(timezone.utc)
+                    - timedelta(seconds=ORPHAN_CLAIM_MIN_AGE_SECONDS + 60))
+                await s.commit()
             async with pdb.session() as s:
                 assert await service.recover_orphaned_claims(s) >= 1
                 await s.commit()
@@ -738,6 +806,309 @@ class TestCredentials:
             rows = await _attempts(req_id)
             # Deferred, not failed: the operator can still paste the key.
             assert rows[-1].status == state.DEFERRED
+            # ...but it must SAY so. This park consumes no try and repeats every
+            # 15 minutes indefinitely, so with no reason on the row the board
+            # showed nothing but "Scheduled, next 12:38" while nothing was ever
+            # going to be sent. Silence here is what made 2026-08-17 invisible.
+            assert rows[-1].error_code == "no_credential"
+            assert "no API key" in rows[-1].error_message
             assert fake.submissions == []
+        run(go())
+
+    def test_a_rejected_key_parks_with_a_reason_that_names_the_rejection(self):
+        # Same park, different cause, and the advice has to differ: "add a key"
+        # is wrong when a key is sitting there rejected.
+        async def go():
+            from datetime import datetime, timezone
+            gid, dest_ids = await _group(name="rejected-key",
+                                         platforms=("youtube",))
+            async with pdb.session() as s:
+                cred = (await s.execute(select(m.PublishCredential).where(
+                    m.PublishCredential.publish_group_id == gid
+                ))).scalar_one()
+                cred.invalid_at = datetime.now(timezone.utc)
+                cred.invalid_reason = "provider said: key revoked"
+                await s.commit()
+
+            req_id, _ = await _publish("job-x2", 0, dest_ids)
+            assert await _drain(rounds=1) == ["no_credential"]
+            rows = await _attempts(req_id)
+            assert rows[-1].status == state.DEFERRED
+            assert "rejected" in rows[-1].error_message
+            assert "key revoked" in rows[-1].error_message
+            assert fake.submissions == []
+        run(go())
+
+
+# --- posting rhythms + remote scheduling ------------------------------------
+def _remote_schedule_capability(monkeypatch, value):
+    """Override the fake's declared remote-schedule support for one test.
+
+    The fake mirrors Status 200, which declares it True. Setting False here is
+    how the "provider cannot hold the clock" branch gets covered without
+    inventing a second fake provider.
+    """
+    import dataclasses
+    monkeypatch.setattr(
+        fake.FakeProvider, "capabilities",
+        dataclasses.replace(fake.FakeProvider.capabilities,
+                            supports_remote_schedule=value))
+
+
+class TestRhythmAndRemoteSchedule:
+    PLAN = {"mode": "rhythm", "start_time": "06:00", "interval_hours": 6,
+            "max_per_day": 2, "timezone": "UTC"}
+
+    async def _rhythm_group(self, name="rhythm-1", platforms=("youtube",)):
+        gid, dest_ids = await _group(name=name, platforms=platforms)
+        async with pdb.session() as s:
+            g = await s.get(m.PublishGroup, gid)
+            g.settings = {"plan": dict(self.PLAN)}
+            await s.commit()
+        return gid, dest_ids
+
+    def test_rhythm_plan_earmarks_then_slots_then_converts(self):
+        """The whole autonomous path: plan_job with schedule=rhythm creates
+        ASSIGNMENTS (not requests), the assigner places them on the group's
+        grid without exceeding the daily cap, and the scheduler converts them
+        to requests carrying the slot — which remote scheduling then submits
+        early with the timestamp."""
+        async def go():
+            from datetime import timezone as tz
+            gid, _ = await self._rhythm_group()
+            for i in range(3):
+                CLIPS[("job-rhythm", i)] = clip()
+            plan = {"group_ids": [str(gid)], "schedule": "rhythm"}
+
+            async with pdb.session() as s:
+                async with s.begin():
+                    report = await planner.plan_job(
+                        s, job_id="job-rhythm", clip_count=3, plan=plan,
+                        actor="test")
+            assert len(report["created"]) == 3
+            assert report["mode"] == "rhythm"
+
+            async with pdb.session() as s:
+                async with s.begin():
+                    assigned = await planner.assign_rhythm_slots(s)
+            assert assigned == 3
+
+            async with pdb.session() as s:
+                rows = (await s.execute(
+                    select(m.PublishAssignment).where(
+                        m.PublishAssignment.publish_group_id == gid)
+                    .order_by(m.PublishAssignment.scheduled_for))).scalars().all()
+            slots = [r.scheduled_for for r in rows]
+            assert all(t is not None for t in slots)
+            assert slots == sorted(slots)
+            # On the rhythm's interval, never closer — a larger gap means the
+            # daily cap pushed the next slot to a later grid position.
+            gaps = {(b - a).total_seconds() for a, b in zip(slots, slots[1:])}
+            assert all(g >= 6 * 3600 for g in gaps)
+            assert all(g % (6 * 3600) == 0 for g in gaps)
+            per_day = {}
+            for t in slots:
+                day = t.astimezone(tz.utc).date()
+                per_day[day] = per_day.get(day, 0) + 1
+            assert max(per_day.values()) <= 2
+
+            async with pdb.session() as s:
+                async with s.begin():
+                    converted = await planner.run_due_assignments(s)
+            assert converted == 3
+            async with pdb.session() as s:
+                statuses = {r.status for r in (await s.execute(
+                    select(m.PublishAssignment).where(
+                        m.PublishAssignment.publish_group_id == gid))
+                ).scalars().all()}
+            assert statuses == {"requested"}
+        run(go())
+
+    def test_second_rhythm_run_books_around_the_first(self):
+        """Batch-wide coordination: a second autopilot run must land on FREE
+        slots, not collide with the first — the exact failure mode of planning
+        each job independently."""
+        async def go():
+            gid, _ = await self._rhythm_group(name="rhythm-2")
+            for run_n in ("first", "second"):
+                for i in range(2):
+                    CLIPS[(f"job-{run_n}", i)] = clip()
+                async with pdb.session() as s:
+                    async with s.begin():
+                        await planner.plan_job(
+                            s, job_id=f"job-{run_n}", clip_count=2,
+                            plan={"group_ids": [str(gid)],
+                                  "schedule": "rhythm"}, actor="test")
+                async with pdb.session() as s:
+                    async with s.begin():
+                        await planner.assign_rhythm_slots(s)
+            async with pdb.session() as s:
+                slots = (await s.execute(
+                    select(m.PublishAssignment.scheduled_for).where(
+                        m.PublishAssignment.publish_group_id == gid)
+                )).scalars().all()
+            assert len(slots) == 4
+            assert len(set(slots)) == 4, "no two clips may share a slot"
+        run(go())
+
+    def test_future_slot_is_promoted_and_submitted_with_the_timestamp(
+            self, monkeypatch):
+        # Opts in: no shipped provider honours a timestamp (Status 200 accepts
+        # and discards it, measured 2026-08-19), so the orchestration this test
+        # covers is dormant until a provider that does honour one arrives. The
+        # machinery is still worth testing — it is provider-agnostic.
+        _remote_schedule_capability(monkeypatch, True)
+        async def go():
+            from datetime import datetime, timedelta, timezone
+            _, dest_ids = await _group(name="remote-1", platforms=("youtube",))
+            when = datetime.now(timezone.utc) + timedelta(hours=6)
+            CLIPS[("job-remote", 0)] = clip()
+            async with pdb.session() as s:
+                dests = await service.expand_destinations(s,
+                                                          destination_ids=dest_ids)
+                req = await service.create_request(
+                    s, job_id="job-remote", clip_index=0, destinations=dests,
+                    payload={"caption": "a normal clip"},
+                    scheduled_for=when, mode="scheduled",
+                    content_fingerprint=CLIPS[("job-remote", 0)]["fingerprint"])
+                await s.commit()
+
+                async with s.begin():
+                    promoted = await dispatcher.promote_remote_schedules(s)
+            assert promoted == 1
+            rows = await _attempts(req.id)
+            assert rows[0].deferred_until is None, "released for early submit"
+
+            outcomes = await _drain()
+            # The fake parks a remote-scheduled post as submitted, live at the
+            # appointed time — never 'succeeded' on the spot.
+            assert outcomes == ["submitted"]
+            assert fake.submissions[0]["scheduled_for"] == when.isoformat()
+            rows = await _attempts(req.id)
+            assert rows[-1].status == state.SUBMITTED
+            assert rows[-1].provider_post_ref
+        run(go())
+
+    def test_field_rejection_falls_back_to_the_local_clock(self, monkeypatch):
+        _remote_schedule_capability(monkeypatch, True)
+        async def go():
+            from datetime import datetime, timedelta, timezone
+            _, dest_ids = await _group(name="remote-2", platforms=("youtube",))
+            when = datetime.now(timezone.utc) + timedelta(hours=6)
+            CLIPS[("job-fallback", 0)] = clip(caption="fail-schedule case")
+            async with pdb.session() as s:
+                dests = await service.expand_destinations(s,
+                                                          destination_ids=dest_ids)
+                req = await service.create_request(
+                    s, job_id="job-fallback", clip_index=0,
+                    destinations=dests,
+                    payload={"caption": "fail-schedule case"},
+                    scheduled_for=when, mode="scheduled",
+                    content_fingerprint=CLIPS[("job-fallback", 0)]["fingerprint"])
+                await s.commit()
+                async with s.begin():
+                    await dispatcher.promote_remote_schedules(s)
+
+            outcomes = await _drain(rounds=1)
+            assert outcomes == ["remote_fallback"]
+            rows = await _attempts(req.id)
+            # Parked on the SLOT, not failed: the local clock takes over and
+            # dispatch resubmits (without the field) when the slot arrives.
+            assert rows[-1].status == state.DEFERRED
+            assert rows[-1].deferred_until is not None
+            assert rows[-1].deferred_until >= when - timedelta(minutes=1)
+            # The field is off for the process, so nothing else is promoted.
+            from publishing.providers import fake as fake_mod
+            assert fake_mod.remote_schedule_available() is False
+            async with pdb.session() as s:
+                async with s.begin():
+                    again = await dispatcher.promote_remote_schedules(s)
+            assert again == 0
+        run(go())
+
+    def test_promotion_respects_the_off_switch(self, monkeypatch):
+        # Opt in to the capability, or this asserts nothing: with the shipped
+        # (False) capability, promoted == 0 for a reason that has nothing to do
+        # with the off switch this test is named after.
+        _remote_schedule_capability(monkeypatch, True)
+
+        async def go():
+            from datetime import datetime, timedelta, timezone
+            monkeypatch.setenv("PUBLISHING_REMOTE_SCHEDULE", "off")
+            _, dest_ids = await _group(name="remote-3", platforms=("youtube",))
+            when = datetime.now(timezone.utc) + timedelta(hours=6)
+            CLIPS[("job-off", 0)] = clip()
+            async with pdb.session() as s:
+                dests = await service.expand_destinations(s,
+                                                          destination_ids=dest_ids)
+                await service.create_request(
+                    s, job_id="job-off", clip_index=0, destinations=dests,
+                    payload={"caption": "a normal clip"}, scheduled_for=when,
+                    mode="scheduled",
+                    content_fingerprint=CLIPS[("job-off", 0)]["fingerprint"])
+                await s.commit()
+                async with s.begin():
+                    promoted = await dispatcher.promote_remote_schedules(s)
+            assert promoted == 0
+        run(go())
+
+    def test_a_provider_that_cannot_schedule_keeps_the_local_clock(
+            self, monkeypatch):
+        """The fallback shape, and the bug this test exists to prevent.
+
+        With `supports_remote_schedule=False` and the mode left at `auto`,
+        nothing may be released early: the attempt has to stay parked on its own
+        slot so THIS machine submits when the slot arrives. When the promote pass
+        and the payload build disagreed about the capability, the attempt was
+        released hours early and then submitted with no timestamp at all —
+        published immediately, spacing gone.
+        """
+        _remote_schedule_capability(monkeypatch, False)
+
+        async def go():
+            from datetime import datetime, timedelta, timezone
+            _, dest_ids = await _group(name="remote-4", platforms=("youtube",))
+            when = datetime.now(timezone.utc) + timedelta(hours=6)
+            CLIPS[("job-local", 0)] = clip()
+            async with pdb.session() as s:
+                dests = await service.expand_destinations(s,
+                                                          destination_ids=dest_ids)
+                req = await service.create_request(
+                    s, job_id="job-local", clip_index=0, destinations=dests,
+                    payload={"caption": "a normal clip"}, scheduled_for=when,
+                    mode="scheduled",
+                    content_fingerprint=CLIPS[("job-local", 0)]["fingerprint"])
+                await s.commit()
+                async with s.begin():
+                    promoted = await dispatcher.promote_remote_schedules(s)
+            assert promoted == 0
+            rows = await _attempts(req.id)
+            assert rows[0].deferred_until is not None, "still parked"
+            assert rows[0].deferred_until >= when - timedelta(minutes=1), \
+                "parked on its own slot, not released"
+            # And nothing is claimable, so a dispatch tick cannot post it early.
+            before = len(fake.submissions)
+            await _drain(rounds=1)
+            assert len(fake.submissions) == before
+        run(go())
+
+    def test_media_registration_paces_transfers(self, monkeypatch):
+        """The congestion fix from 2026-08-15: two registrations cannot start
+        closer together than the configured gap, whatever else is happening."""
+        async def go():
+            import time as _time
+            monkeypatch.setenv("PUBLISHING_MEDIA_REGISTRATION_GAP", "1")
+            dispatcher._last_media_registration = 0.0
+            async def one_registration():
+                await dispatcher._media_pacer()
+                try:
+                    await asyncio.sleep(0)
+                finally:
+                    dispatcher._media_pacer_done()
+            started = _time.monotonic()
+            await one_registration()
+            await one_registration()
+            elapsed = _time.monotonic() - started
+            assert elapsed >= 0.9, f"gap not enforced ({elapsed:.2f}s)"
         run(go())
 

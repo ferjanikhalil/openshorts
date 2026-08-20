@@ -983,9 +983,13 @@ def _schedule_autopublish(job_id: str, clip_count: int, loop):
             if job is not None:
                 n = len(report.get('created') or [])
                 skipped = len(report.get('skipped') or [])
+                if report.get('mode') == 'rhythm':
+                    msg = (f"Publishing: {n} clip(s) queued on the groups' "
+                           f"posting rhythms")
+                else:
+                    msg = f"Publishing: {n} post(s) scheduled"
                 job.setdefault('logs', []).append(
-                    f"Publishing: {n} post(s) scheduled"
-                    + (f", {skipped} clip(s) skipped." if skipped else "."))
+                    msg + (f", {skipped} clip(s) skipped." if skipped else "."))
 
         asyncio.run_coroutine_threadsafe(_run(), loop)
     except Exception as e:

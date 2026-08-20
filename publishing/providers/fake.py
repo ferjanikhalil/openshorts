@@ -11,6 +11,9 @@ the caption or the account ref, so a test (or a human clicking around) can force
 each failure mode deterministically:
 
   ``fail-auth``       -> 401-equivalent, credential marked invalid
+  ``fail-account-auth`` -> 401 about ONE account's expired platform token:
+                         that destination goes ``disconnected``, the group's key
+                         stays usable so the other platforms still publish
   ``fail-blocked``    -> 403-equivalent, destination marked blocked
   ``fail-transient``  -> retryable network error
   ``fail-oversize``   -> permanent media-too-large
@@ -29,8 +32,8 @@ from typing import Optional
 
 from .. import platforms as plat
 from ..errors import (
-    E_AUTH, E_MEDIA_TOO_LARGE, E_NETWORK, E_NOT_CONNECTED, E_UNKNOWN,
-    ProviderError,
+    E_ACCOUNT_AUTH, E_AUTH, E_MEDIA_TOO_LARGE, E_NETWORK, E_NOT_CONNECTED,
+    E_REMOTE_SCHEDULE, E_UNKNOWN, ProviderError,
 )
 from .base import (
     Capabilities, MediaRef, PublishPayload, SubmitResult, WebhookEvent,
@@ -48,12 +51,30 @@ CAPABILITIES = Capabilities(
     # branches the real provider will take. A fake with richer capabilities would
     # test code paths that never run in production.
     supports_status_lookup=False,
+    # False since 2026-08-19, mirroring the measurement on the real provider:
+    # Status 200 accepts `scheduledFor` and discards it. A fake that schedules
+    # when the real one does not would make dry-run *look* like it spaces posts
+    # out while production fires them all at once. Tests that need the remote
+    # path opt in per-test — see `_remote_schedule_capability` in the e2e suite.
     supports_remote_schedule=False,
     supports_cancel_scheduled=False,
     supports_account_listing=False,
     supports_webhooks=True,
     one_platform_per_request=True,
 )
+
+# Process-lifetime health of the remote-schedule field, mirroring the real
+# adapter so dispatcher gating logic behaves identically in dry run.
+_remote_schedule_ok = True
+
+
+def remote_schedule_available() -> bool:
+    return _remote_schedule_ok
+
+
+def remote_schedule_disable(reason: str) -> None:
+    global _remote_schedule_ok
+    _remote_schedule_ok = False
 
 # Everything the fake did, for assertions and for the dry-run admin view.
 submissions = []
@@ -63,13 +84,18 @@ uploads = []
 def reset():
     submissions.clear()
     uploads.clear()
+    global _remote_schedule_ok
+    _remote_schedule_ok = True
 
 
 def _marker(payload: PublishPayload) -> str:
     blob = f"{payload.caption or ''} {payload.provider_account_ref or ''}".lower()
-    for m in ("fail-auth", "fail-blocked", "fail-transient", "fail-oversize",
-              "fail-unknown", "fail-ambiguous", "refuse-capacity", "quota",
-              "slow"):
+    # "fail-account-auth" is listed before "fail-auth" because the first match
+    # wins and the narrower marker has to get the chance to claim the blob.
+    for m in ("fail-account-auth", "fail-auth", "fail-blocked",
+              "fail-transient", "fail-oversize",
+              "fail-unknown", "fail-ambiguous", "fail-schedule",
+              "refuse-capacity", "quota", "slow"):
         if m in blob:
             return m
     return ""
@@ -77,6 +103,12 @@ def _marker(payload: PublishPayload) -> str:
 
 class FakeProvider:
     capabilities = CAPABILITIES
+
+    def remote_schedule_ok(self) -> bool:
+        return remote_schedule_available()
+
+    def disable_remote_schedule(self, reason: str) -> None:
+        remote_schedule_disable(reason)
 
     async def upload_media(self, api_key: str, *, media_url: str,
                            mime_type: Optional[str] = None) -> MediaRef:
@@ -104,11 +136,20 @@ class FakeProvider:
             "account": payload.provider_account_ref,
             "caption": payload.caption,
             "media_ref": payload.media_ref,
+            "scheduled_for": (payload.scheduled_for.isoformat()
+                              if payload.scheduled_for else None),
             "marker": marker,
             "at": time.time(),
         }
         submissions.append(record)
 
+        if marker == "fail-account-auth":
+            # Same 401 status as fail-auth, different blast radius: the key is
+            # good, one linked account's platform token is not.
+            raise ProviderError(
+                E_ACCOUNT_AUTH,
+                "fake: the Instagram session has expired, please reconnect the "
+                "account", status_code=401)
         if marker == "fail-auth":
             raise ProviderError(E_AUTH, "fake: invalid credential",
                                 status_code=401)
@@ -116,6 +157,14 @@ class FakeProvider:
             raise ProviderError(E_NOT_CONNECTED,
                                 "fake: destination not connected",
                                 status_code=403)
+        if marker == "fail-schedule":
+            # Mirrors the live API rejecting the scheduledFor field: a 4xx, so
+            # nothing was created and the dispatcher falls back to the local
+            # clock instead of failing the post.
+            raise ProviderError(
+                E_REMOTE_SCHEDULE,
+                "fake: unknown field scheduledFor", status_code=400,
+                response={"error": "unknown field: scheduledFor"})
         if marker == "fail-transient":
             raise ProviderError(E_NETWORK, "fake: transient submit failure")
         if marker == "fail-oversize":
@@ -166,6 +215,19 @@ class FakeProvider:
                 status="submitted", provider_post_ref=post_ref,
                 quota={"limit": 5, "remaining": 3},
                 raw={"status": "pending"},
+            )
+        if payload.scheduled_for is not None:
+            # Remote scheduling accepted: the post EXISTS on the provider and
+            # goes live at the appointed time. Silence until then is expected,
+            # so defer_seconds tells the sweeper how long.
+            delta = max(1, int((payload.scheduled_for - datetime.now(
+                timezone.utc)).total_seconds()))
+            return SubmitResult(
+                status="submitted", provider_post_ref=post_ref,
+                defer_seconds=delta,
+                quota={"limit": 5, "remaining": 4},
+                raw={"status": "scheduled",
+                     "scheduledFor": payload.scheduled_for.isoformat()},
             )
         return SubmitResult(
             status="succeeded", provider_post_ref=post_ref,

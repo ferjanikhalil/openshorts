@@ -1,0 +1,11 @@
+{
+  "name": "openshorts-publisher-heartbeat",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker cron that keeps the publishing Space awake and alerts when it is not.",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  }
+}

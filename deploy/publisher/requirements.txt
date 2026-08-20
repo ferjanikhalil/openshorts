@@ -1,0 +1,31 @@
+# Dependency set for the always-on publisher (deploy/publisher/Dockerfile).
+#
+# The point of this file is what it OMITS. The root requirements.txt pulls torch,
+# ultralytics, mediapipe, faster-whisper and opencv — gigabytes of model runtime
+# for work this host never does. A publisher submits clips that are already
+# staged in object storage, so it needs a web framework, a Postgres driver, an
+# HTTP client, an S3 signer and AES-GCM. That difference is what makes the image
+# buildable on a free-tier VM.
+#
+# The DB and crypto pins are pulled in rather than restated, so bumping one file
+# cannot leave the two halves of a split deployment on different SQLAlchemy
+# versions while they share a database. That include is why the Dockerfile must
+# be built from the repository root — see its header.
+-r ../../requirements-publishing.txt
+
+# --- pinned to match the root requirements.txt exactly, for the same reason ---
+fastapi==0.136.1
+uvicorn==0.46.0
+httpx==0.28.1
+
+# Presigns the object-store URLs the provider downloads from. Not optional here:
+# without boto3, media_strategy() falls back to serving clip bytes from THIS
+# host, and this host has no clip bytes.
+boto3==1.43.4
+
+# Not installed, deliberately:
+#   alembic          — the boot path is create_all. Run migrations from the app
+#                      host, which has it, against this same database.
+#   python-multipart — no publishing route takes a form or a file upload.
+#   python-dotenv    — env arrives from compose (env_file), not from a .env read
+#                      inside the process.

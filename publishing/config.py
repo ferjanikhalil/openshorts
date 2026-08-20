@@ -29,9 +29,60 @@ BACKOFF_CAP_SECONDS = 3600
 # may already be live double-publishes to a real audience.
 SUBMIT_TIMEOUT_SECONDS = 1800
 
+# How old a claim must be before boot recovery treats it as abandoned.
+#
+# `in_flight` means "claimed, not yet handed to the provider", and recovery
+# re-queues those rows. With ONE long-lived process that is unambiguous: nothing
+# is in flight at boot. With two — the app host and the always-on publisher share
+# this queue by design — a recovery pass can meet a claim that a *live* worker is
+# still working through, and re-queuing that one is how the same clip gets posted
+# twice.
+#
+# The bound is derived from how long a claim can legitimately live: one dispatch
+# is at most a media registration plus a submit, each capped by the provider
+# client at 10s connect + 120s read, so ~260s. `dispatch_once` then works its
+# claimed batch serially, so with the default limit of 10 the last row in a batch
+# can sit in flight far longer than that. 15 minutes covers a single dispatch
+# several times over without waiting out a whole batch.
+#
+# It is a thrash-avoidance knob, NOT the safety boundary. The boundary is the
+# claim-ownership check in `dispatcher.dispatch_attempt`, which is what makes an
+# early recovery cost a wasted claim instead of a duplicate post.
+ORPHAN_CLAIM_MIN_AGE_SECONDS = 900
+
 # Provider media refs expire (Status 200: 7 days). Refresh a ref this long
 # before its stated expiry so a scheduled post never submits a dead ref.
 MEDIA_REFRESH_MARGIN_SECONDS = 3600
+
+# Lifetime of the media URL given to the provider. It keeps that URL and fetches
+# from it at POST time, so it must outlive the ref above — not the HTTP request
+# that created it. 7 days is also SigV4's maximum for a presigned URL.
+DEFAULT_PROVIDER_MEDIA_URL_TTL_SECONDS = 7 * 24 * 3600
+
+# Minimum wall-clock gap between two provider media registrations. The provider
+# ingests media by pulling the whole clip from OUR origin, so back-to-back
+# registrations are back-to-back multi-hundred-MB downloads through one tunnel
+# or uplink — the congestion spiral observed 2026-08-15. One per gap is the
+# ceiling a self-hosted origin can actually serve.
+DEFAULT_MEDIA_REGISTRATION_GAP_SECONDS = 90
+
+# Staging clips in an object store (publishing/objectstore.py). The transfer loop
+# polls this often for work; a pass that moves a clip loops again immediately, so
+# this is idle latency, not throughput.
+DEFAULT_TRANSFER_INTERVAL_SECONDS = 15
+# How long a staged object outlives the last attempt that needs it. Objects for
+# posts still queued are never swept regardless of age; this only governs the
+# tail, and it is what keeps a free-tier bucket from filling up.
+DEFAULT_STORE_RETENTION_HOURS = 48
+# The retention sweep is a list + a handful of deletes. Once per half hour is
+# plenty and keeps the free tiers' request counts irrelevant.
+STORE_SWEEP_INTERVAL_SECONDS = 1800
+
+# Remote scheduling delivery. "auto" (default) hands a scheduled post to the
+# provider immediately together with its future timestamp, and falls back to
+# the local clock only if the live API rejects the field; "off" always holds
+# the clock locally and submits at the appointed time.
+DEFAULT_REMOTE_SCHEDULE_MODE = "auto"
 
 # Webhook events carrying a created_at outside this window are rejected. The
 # signature alone has no timestamp/nonce, so it never expires on its own — this
@@ -85,6 +136,24 @@ class Settings:
     def media_url_ttl_seconds(self) -> int:
         return int(os.environ.get("PUBLISHING_MEDIA_URL_TTL", "3600"))
 
+    @property
+    def provider_media_url_ttl_seconds(self) -> int:
+        """TTL for a URL handed to the PROVIDER, which is a different lifetime.
+
+        Status 200 does not copy the bytes at registration — it keeps the URL and
+        downloads from it when the post actually goes out, which for a scheduled
+        post is hours or days later. So this URL has to outlive the media ref
+        (7 days), not the request that created it. A one-hour URL here is a post
+        that fails at its slot with "could not download", long after everything
+        looked fine.
+
+        Clamped to SigV4's 7-day ceiling; a longer value would produce presigned
+        URLs the store rejects outright.
+        """
+        raw = int(os.environ.get("PUBLISHING_PROVIDER_MEDIA_URL_TTL",
+                                 str(DEFAULT_PROVIDER_MEDIA_URL_TTL_SECONDS)))
+        return max(3600, min(raw, 7 * 24 * 3600))
+
     # --- Concurrency ---
     @property
     def max_concurrent_uploads(self) -> int:
@@ -112,6 +181,58 @@ class Settings:
     def submit_timeout_seconds(self) -> int:
         return int(os.environ.get("PUBLISHING_SUBMIT_TIMEOUT",
                                  str(SUBMIT_TIMEOUT_SECONDS)))
+
+    @property
+    def orphan_claim_min_age_seconds(self) -> int:
+        """Age at which boot recovery may re-queue an ``in_flight`` claim.
+
+        Lower means a claim abandoned by a killed process is retried sooner;
+        higher means less chance of a recovery pass colliding with a worker that
+        is still mid-batch. See ORPHAN_CLAIM_MIN_AGE_SECONDS for the derivation.
+        """
+        return int(os.environ.get("PUBLISHING_ORPHAN_CLAIM_MIN_AGE",
+                                  str(ORPHAN_CLAIM_MIN_AGE_SECONDS)))
+
+    @property
+    def media_registration_gap_seconds(self) -> float:
+        return float(os.environ.get(
+            "PUBLISHING_MEDIA_REGISTRATION_GAP",
+            str(DEFAULT_MEDIA_REGISTRATION_GAP_SECONDS)))
+
+    # --- Object-store staging ---
+    @property
+    def transfer_interval_seconds(self) -> float:
+        return float(os.environ.get("PUBLISHING_TRANSFER_INTERVAL",
+                                    str(DEFAULT_TRANSFER_INTERVAL_SECONDS)))
+
+    @property
+    def store_retention_hours(self) -> float:
+        """0 disables the sweep — for a bucket with its own lifecycle rule."""
+        return float(os.environ.get("PUBLISHING_STORE_RETENTION_HOURS",
+                                    str(DEFAULT_STORE_RETENTION_HOURS)))
+
+    @property
+    def remote_schedule_mode(self) -> str:
+        mode = os.environ.get("PUBLISHING_REMOTE_SCHEDULE",
+                              DEFAULT_REMOTE_SCHEDULE_MODE).strip().lower()
+        return mode if mode in ("auto", "on", "off") else "auto"
+
+    @property
+    def role(self) -> str:
+        """``full`` (default) or ``publisher``. Cosmetic to dispatch, not to health.
+
+        A publisher-only instance is the always-on half of a split deployment: it
+        shares the database but holds no clip files, because the machine that
+        generates clips may be asleep at a slot. Everything that matters about
+        that difference is already self-describing at runtime — no clip resolver
+        is registered, and the dispatcher answers from ``publish_media`` instead
+        (see ``dispatcher._staged_info``). The one thing that is NOT
+        self-describing is whether the absence is intentional: a full instance
+        with no resolver is broken, and a publisher with no resolver is correct.
+        Health has to tell those apart, so the operator declares it.
+        """
+        role = os.environ.get("PUBLISHING_ROLE", "full").strip().lower()
+        return role if role in ("full", "publisher") else "full"
 
     # --- Provider selection ---
     @property

@@ -99,6 +99,12 @@ class SubmitResult:
     # Parsed quota view for the destination row: limit / remaining / reset_at.
     quota: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
+    # Set when a submit asked the provider to hold a FUTURE slot and the response
+    # shows the post already live. The post is real (so this is 'succeeded', not
+    # a failure) but the schedule was silently dropped: the orchestrator logs it
+    # and stops handing the clock over. Without this, an accept-then-ignore is
+    # indistinguishable from a post genuinely parked until its slot.
+    schedule_ignored: bool = False
 
 
 @dataclass

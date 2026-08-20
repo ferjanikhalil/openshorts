@@ -333,7 +333,8 @@ export default function PublishModal({
               {!preview.media_ready && (
                 <p className="mt-1.5 text-xs text-warn">
                   No public media origin is configured, so the provider cannot fetch
-                  the video. Set PUBLISHING_PUBLIC_BASE_URL or R2 credentials.
+                  the video. Set PUBLISHING_S3_* (any S3-compatible bucket),
+                  PUBLISHING_PUBLIC_BASE_URL, or R2 credentials.
                 </p>
               )}
               {blocked.map((c) => (

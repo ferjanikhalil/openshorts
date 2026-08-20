@@ -69,8 +69,8 @@ def destination_out(row) -> dict:
     }
 
 
-def attempt_out(row, destination=None) -> dict:
-    return {
+def attempt_out(row, destination=None, include_raw=False) -> dict:
+    out = {
         "id": str(row.id),
         "publish_request_id": str(row.publish_request_id),
         "publish_destination_id": str(row.publish_destination_id),
@@ -93,6 +93,15 @@ def attempt_out(row, destination=None) -> dict:
             (destination.display_name or destination.provider_account_ref)
             if destination is not None else None),
     }
+    if include_raw:
+        # ADMIN ONLY. What the provider actually answered, verbatim. Off by
+        # default because provider internals are not part of the public shape,
+        # and on for admins because when an attempt reads `unknown` — or claims
+        # to be scheduled while the post is already live — this body is the only
+        # evidence of what really happened.
+        out["provider_response"] = row.provider_response
+        out["quota_snapshot"] = row.quota_snapshot
+    return out
 
 
 def request_out(row, attempts=None) -> dict:

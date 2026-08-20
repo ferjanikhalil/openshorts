@@ -14,6 +14,14 @@ from typing import Optional
 # --- Error codes ------------------------------------------------------------
 # Permanent — retrying cannot help. A human must change something.
 E_AUTH = "auth_invalid"                # bad/revoked API key
+# The API key is fine; ONE connected account's platform token expired at the
+# provider and that account has to be re-linked. Distinct from E_AUTH because the
+# blast radius is different by an order of magnitude: E_AUTH stops every post for
+# the group, this stops one destination. Conflating them is what took a whole
+# group offline on 2026-08-17 when a single Instagram session expired — every
+# platform then hit "no usable credential" and re-parked itself every 15 minutes,
+# silently, forever. Wording that means THIS must never be classified as E_AUTH.
+E_ACCOUNT_AUTH = "account_reauth_required"
 E_NOT_CONNECTED = "not_connected"      # destination not linked at the provider
 E_VALIDATION = "validation"            # malformed request / bad caption
 E_MEDIA_TOO_LARGE = "media_too_large"  # exceeds the platform ceiling
@@ -25,6 +33,12 @@ E_DUPLICATE = "duplicate"              # provider says it already has this post
 E_NETWORK = "network"
 E_TIMEOUT = "timeout"
 E_PROVIDER_5XX = "provider_error"
+# Our own media staging has not finished: the clip is still being copied to the
+# object store the provider will fetch it from. Nothing has been sent, nothing is
+# wrong — the transfer loop is mid-upload. Transient so that any path which does
+# not special-case it waits instead of killing the post; the dispatcher parks
+# without consuming a try, because a slow uplink must not spend the retry budget.
+E_MEDIA_PENDING = "media_pending"
 
 # Capacity — retry, but on the provider's clock, not ours.
 E_RATE_LIMITED = "rate_limited"        # spacing cooldown; Retry-After applies
@@ -33,17 +47,24 @@ E_QUOTA_EXHAUSTED = "quota_exhausted"  # daily cap; wait for the reset
 # Ambiguous — we do not know whether the post went out.
 E_UNKNOWN = "unknown"
 
+# The provider refused the remote-schedule FIELD itself (not the post): nothing
+# was created, so the safe response is to fall back to the local clock — submit
+# at the appointed time without the timestamp — never to retry the same shape.
+E_REMOTE_SCHEDULE = "remote_schedule_unsupported"
+
 PERMANENT = frozenset({
-    E_AUTH, E_NOT_CONNECTED, E_VALIDATION, E_MEDIA_TOO_LARGE,
+    E_AUTH, E_ACCOUNT_AUTH, E_NOT_CONNECTED, E_VALIDATION, E_MEDIA_TOO_LARGE,
     E_MEDIA_UNFETCHABLE, E_UNSUPPORTED, E_DUPLICATE,
 })
-TRANSIENT = frozenset({E_NETWORK, E_TIMEOUT, E_PROVIDER_5XX})
+TRANSIENT = frozenset({E_NETWORK, E_TIMEOUT, E_PROVIDER_5XX, E_MEDIA_PENDING})
 CAPACITY = frozenset({E_RATE_LIMITED, E_QUOTA_EXHAUSTED})
 
 # Errors that mean the DESTINATION is broken, not the post. These mark the
 # destination unhealthy so the next 26 posts of the day don't each rediscover it.
-DESTINATION_FATAL = frozenset({E_NOT_CONNECTED})
+DESTINATION_FATAL = frozenset({E_NOT_CONNECTED, E_ACCOUNT_AUTH})
 # Errors that mean the CREDENTIAL is broken. Same reasoning, one level up.
+# Deliberately narrow: everything in here disables publishing for a whole group,
+# so a failure only belongs when it is provably about the API key itself.
 CREDENTIAL_FATAL = frozenset({E_AUTH})
 
 

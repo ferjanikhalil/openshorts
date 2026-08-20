@@ -1,0 +1,88 @@
+# The always-on host's whole stack: Postgres, plus the publisher that holds the
+# schedule clock. Run from this directory:
+#
+#     docker compose up -d --build
+#
+# This machine owns the database, because the database is the one thing both
+# halves need at every moment and the laptop is asleep for most of them. The app
+# host points its DATABASE_URL here over a private link. See README.md.
+#
+# NO PROVIDER API KEY APPEARS HERE. Status 200 keys are entered through the admin
+# UI, sealed with AES-256-GCM, and never returned to the frontend. The secrets
+# this file names — the master key that unwraps them, and the media-store keys —
+# are read from .env beside this file and have no literal value here.
+name: openshorts-publisher
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: openshorts-publisher-db
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-openshorts}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in deploy/publisher/.env}
+      - POSTGRES_DB=${POSTGRES_DB:-openshorts}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Bound to ONE address, and by default that address is loopback.
+    #
+    # Read this before changing it: `ports:` is NOT filtered by ufw. Docker writes
+    # its own DNAT rules that are traversed before the INPUT chain, so a published
+    # port is reachable from the internet even while `ufw status` reports it as
+    # denied. The bind address is the control that actually holds. Set
+    # DB_BIND_ADDR to this host's private tailnet address (100.x.y.z) so the app
+    # host can connect and nothing else can.
+    ports:
+      - "${DB_BIND_ADDR:-127.0.0.1}:5432:5432"
+    healthcheck:
+      # `-h 127.0.0.1` is load-bearing: it forces a TCP check. Without a host,
+      # pg_isready uses the unix socket, and during initdb this image runs a
+      # temporary server on the socket ONLY (listen_addresses=''). So a bare
+      # pg_isready reports ready while TCP is still refused, service_healthy
+      # releases the publisher too early, and its first boot dies with
+      # ConnectionRefusedError on port 5432. Measured, not theoretical — that is
+      # exactly how the first boot of this file failed.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-openshorts}"]
+      interval: 5s
+      timeout: 3s
+      # ~2.5 min of grace. initdb on a free-tier ARM instance with a cold page
+      # cache is slow, and the publisher exits rather than waits (see its comment
+      # below), so this retry budget is what keeps the first boot from flapping.
+      retries: 30
+    restart: unless-stopped
+
+  publisher:
+    build:
+      # Repo root: the image's requirements file includes one from there.
+      context: ../..
+      dockerfile: deploy/publisher/Dockerfile
+    container_name: openshorts-publisher
+    depends_on:
+      db:
+        condition: service_healthy
+    # Carries PUBLISHING_MASTER_KEY and the PUBLISHING_S3_* media-store keys.
+    env_file:
+      - .env
+    environment:
+      - PUBLISHING_ENABLED=1
+      # Declares "no clip files here, on purpose" so /api/publishing/health can
+      # tell that apart from a resolver that failed to register.
+      - PUBLISHING_ROLE=publisher
+      # In-network, so this never crosses the tailnet or the internet. A password
+      # with @ / : / # in it would corrupt this URL — generate a hex one.
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-openshorts}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-openshorts}
+    # Loopback by default, for the same reason as the database: on plain HTTP the
+    # admin router's bearer token would cross the internet in cleartext. Publish
+    # this publicly only behind the TLS terminator in README.md's webhook step,
+    # or bind it to the tailnet address for admin access.
+    ports:
+      - "${PUBLISHER_BIND_ADDR:-127.0.0.1}:8000:8000"
+    # This is the retry loop for the database, and the only one. The app does not
+    # wait for Postgres — an unreachable DB fails startup and uvicorn exits, which
+    # is the right call for a host whose whole purpose is to be dependable: a
+    # publisher that boots without its queue would sit there looking up while
+    # posting nothing. So a transient DB outage shows as a restart and a traceback
+    # in the log, not as silence. Do not "fix" that by swallowing the error.
+    restart: unless-stopped
+
+volumes:
+  pgdata:

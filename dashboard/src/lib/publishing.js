@@ -170,6 +170,8 @@ export const listAssignments = (params = {}) => {
 export const deleteAssignment = (id) => del(`${ADMIN}/assignments/${id}`);
 export const groupCapacity = (groupId) =>
   jsonOrThrow(`${ADMIN}/groups/${groupId}/capacity`);
+export const groupPlanPreview = (groupId, count = 6) =>
+  jsonOrThrow(`${ADMIN}/groups/${groupId}/plan/preview?count=${count}`);
 export const runScheduler = () => post(`${ADMIN}/schedule/run`);
 
 // --- Audit ------------------------------------------------------------------

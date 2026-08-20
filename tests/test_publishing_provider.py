@@ -30,6 +30,21 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _reset_remote_schedule_health():
+    """Both adapters carry PROCESS-lifetime remote-schedule health.
+
+    A test that trips the detector would otherwise leave the field disabled for
+    every test that runs after it, and the failure would depend on collection
+    order. Reset on both sides of the test.
+    """
+    status200._remote_schedule_ok = True
+    fake.reset()
+    yield
+    status200._remote_schedule_ok = True
+    fake.reset()
+
+
 # Captured once, before any monkeypatching. Subclassing the *live*
 # httpx.AsyncClient would nest a previous test's transport underneath the new one
 # and the older handler would win.
@@ -279,23 +294,171 @@ class TestSubmitRequestShape:
             platform=plat.YOUTUBE, options={"privacyStatus": "private"})))
         assert body_of(seen[0])["post"]["youtube"]["privacyStatus"] == "private"
 
-    def test_scheduled_for_is_never_forwarded(self, monkeypatch):
-        # Load-bearing: there is no working cancel endpoint, so a remotely
-        # scheduled post would be unrecallable. The dispatcher holds the clock.
+    def test_scheduled_for_is_forwarded_as_scheduledFor(self, monkeypatch):
+        # The provider holds the clock (docs v1.4.0): submit now, publish at
+        # the appointed time. Load-bearing in BOTH directions — the machine
+        # may be off at the slot, and a live rejection of the field falls back
+        # to the local clock rather than failing the post.
         seen = install(monkeypatch, json_route(
-            200, {"status": "published", "post_id": "p_1"}))
-        when = datetime.now(timezone.utc) + timedelta(hours=6)
+            200, {"status": "scheduled", "post_id": "p_1"}))
+        when = datetime(2026, 8, 18, 17, 0, 0, tzinfo=timezone.utc)
         run(status200.PROVIDER.submit(API_KEY, payload(scheduled_for=when)))
 
-        raw = seen[0].content.decode()
-        assert "scheduled" not in raw.lower()
-        assert str(when.year) not in raw
+        # PINNED to the provider's documented shape, NOT to whatever Python's
+        # isoformat() happens to emit. The previous version of this assertion
+        # compared the field against `when.isoformat()` — our own output — so it
+        # passed while the value on the wire was `2026-08-18T17:00:00+00:00`,
+        # which the far side dropped silently. Every post scheduled through this
+        # adapter published immediately, and the suite stayed green.
+        assert body_of(seen[0])["post"]["scheduledFor"] == "2026-08-18T17:00:00.000Z"
+
+    @pytest.mark.parametrize("given,expected", [
+        # UTC-aware: the +00:00 offset must never reach the wire.
+        (datetime(2026, 8, 18, 17, 0, tzinfo=timezone.utc),
+         "2026-08-18T17:00:00.000Z"),
+        # Naive is read as UTC, not as local time — a slot must not shift by the
+        # server's timezone.
+        (datetime(2026, 8, 18, 17, 0), "2026-08-18T17:00:00.000Z"),
+        # A non-UTC offset is converted, not truncated.
+        (datetime(2026, 8, 18, 19, 0,
+                  tzinfo=timezone(timedelta(hours=2))),
+         "2026-08-18T17:00:00.000Z"),
+        # Sub-second precision is truncated to milliseconds, JS-style.
+        (datetime(2026, 8, 18, 17, 0, 0, 123456, tzinfo=timezone.utc),
+         "2026-08-18T17:00:00.123Z"),
+    ])
+    def test_timestamp_format_is_the_documented_one(self, given, expected):
+        assert status200._iso_z(given) == expected
+        # Belt and braces: no numeric offset, ever.
+        assert "+" not in status200._iso_z(given)
+        assert status200._iso_z(given).endswith("Z")
+
+    def test_published_response_to_a_scheduled_post_is_flagged(self, monkeypatch):
+        # The silent-drop detector. A future slot was requested and the provider
+        # answers "published": the post is LIVE, hours early, and no error was
+        # raised anywhere. Succeeded (it exists — resubmitting would duplicate
+        # it), flagged, and hand-over disabled for the process.
+        install(monkeypatch, json_route(
+            200, {"status": "published", "post_id": "p_early"}))
+        when = datetime.now(timezone.utc) + timedelta(hours=6)
+        res = run(status200.PROVIDER.submit(API_KEY, payload(scheduled_for=when)))
+        assert res.status == "succeeded"
+        assert res.schedule_ignored is True
+        assert status200.remote_schedule_available() is False
+
+    def test_published_without_a_schedule_is_not_flagged(self, monkeypatch):
+        install(monkeypatch, json_route(
+            200, {"status": "published", "post_id": "p_now"}))
+        res = run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert res.status == "succeeded"
+        assert res.schedule_ignored is False
+        assert status200.remote_schedule_available() is True
+
+    # The two bodies below are VERBATIM live responses, copied out of
+    # attempt.provider_response for the two posts of 2026-08-18 that each asked
+    # for a slot 2.5 hours out and went out on the spot. They are the reason the
+    # detector cannot test for "published": neither says it.
+    LIVE_YOUTUBE = {"data": {
+        "job_id": "ff0d269b-9a04-4fa1-810c-2e9b69cc730a",
+        "status": "processing",
+        "message": "YouTube upload started in the background. Poll action "
+                   "check_job_status or check post history."}}
+    LIVE_TIKTOK = {
+        "data": {"status": "processing",
+                 "message": "Post is being processed. Check post history for "
+                            "updates.",
+                 "post_id": "d3c6d4ca-74a5-4aa3-8cab-3526136bf3de",
+                 "publish_id": "v_pub_file~v2-1.7675375795174819861"},
+        "error": {"code": "ok", "log_id": "20260818221844518AABF", "message": ""}}
+
+    @pytest.mark.parametrize("body,ref", [
+        (LIVE_YOUTUBE, "ff0d269b-9a04-4fa1-810c-2e9b69cc730a"),
+        (LIVE_TIKTOK, "d3c6d4ca-74a5-4aa3-8cab-3526136bf3de"),
+    ])
+    def test_the_real_dropped_schedule_is_flagged(self, monkeypatch, body, ref):
+        # A regression test for the blind spot, not for the bug. Even with the
+        # timestamp format fixed, if the provider ever drops a slot again it must
+        # cost ONE post: flagged here, hand-over off, event in the log.
+        install(monkeypatch, json_route(200, body))
+        when = datetime.now(timezone.utc) + timedelta(hours=6)
+        res = run(status200.PROVIDER.submit(API_KEY, payload(scheduled_for=when)))
+        assert res.schedule_ignored is True
+        assert status200.remote_schedule_available() is False
+        # ...and the post is still recorded, with a handle. A YouTube submit
+        # returns only a job_id; without it the ref is null, no webhook can be
+        # matched to it, and the post ages into `unknown` while being live.
+        assert res.status == "submitted"
+        assert res.provider_post_ref == ref
+
+    def test_an_echoed_timestamp_proves_the_slot_was_kept(self, monkeypatch):
+        # The one positive signal that outranks the status: if the provider
+        # echoes the slot back, it took it, whatever else it calls itself.
+        install(monkeypatch, json_route(200, {"data": {
+            "status": "processing", "post_id": "p_ok",
+            "scheduledFor": "2026-08-19T17:00:00.000Z"}}))
+        when = datetime.now(timezone.utc) + timedelta(hours=6)
+        res = run(status200.PROVIDER.submit(API_KEY, payload(scheduled_for=when)))
+        assert res.schedule_ignored is False
+        assert status200.remote_schedule_available() is True
+
+    def test_processing_without_a_schedule_is_never_flagged(self, monkeypatch):
+        # "processing" is the normal answer to an immediate post. Flagging it
+        # here would disable hand-over for everyone who never asked for a slot.
+        install(monkeypatch, json_route(200, self.LIVE_TIKTOK))
+        res = run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert res.schedule_ignored is False
+        assert status200.remote_schedule_available() is True
+        assert res.provider_native_post_ref == "v_pub_file~v2-1.7675375795174819861"
+
+    def test_no_timestamp_no_field(self, monkeypatch):
+        seen = install(monkeypatch, json_route(
+            200, {"status": "published", "post_id": "p_1"}))
+        run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert "scheduledFor" not in body_of(seen[0])["post"]
+
+    def test_scheduled_status_reports_submitted_not_succeeded(self, monkeypatch):
+        # "scheduled" means accepted-but-not-live: a webhook resolves it.
+        install(monkeypatch, json_route(
+            200, {"status": "scheduled", "post_id": "p_sched"}))
+        when = datetime.now(timezone.utc) + timedelta(hours=6)
+        res = run(status200.PROVIDER.submit(
+            API_KEY, payload(scheduled_for=when)))
+        assert res.status == "submitted"
+        assert res.provider_post_ref == "p_sched"
+
+    def test_field_rejection_maps_to_remote_schedule_error(self, monkeypatch):
+        # A 4xx naming the field created nothing; the dispatcher must be able
+        # to distinguish "fall back to the local clock" from a failed post.
+        install(monkeypatch, json_route(
+            400, {"error": "unknown field: scheduledFor"}))
+        when = datetime.now(timezone.utc) + timedelta(hours=6)
+        with pytest.raises(errors.ProviderError) as ei:
+            run(status200.PROVIDER.submit(
+                API_KEY, payload(scheduled_for=when)))
+        assert ei.value.code == errors.E_REMOTE_SCHEDULE
 
 
 # --------------------------------------------------------------------------
 # Submit — response handling
 # --------------------------------------------------------------------------
 class TestSubmitResponses:
+    @pytest.mark.parametrize("body", [
+        {"status": "published", "post_id": "p_42"},
+        # Wrapped, mirroring the request envelope. A flat lookup returns None
+        # here, and a null post ref cannot be matched to an inbound webhook — so
+        # the post ages into `unknown` while being perfectly live. That is what
+        # happened in production on 2026-08-18.
+        {"post": {"status": "published", "id": "p_42"}},
+        {"data": {"status": "published", "postId": "p_42"}},
+        {"success": True, "result": {"status": "published",
+                                     "scheduled_post_id": "p_42"}},
+    ])
+    def test_post_ref_is_found_wrapped_or_flat(self, monkeypatch, body):
+        install(monkeypatch, json_route(200, body))
+        res = run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert res.provider_post_ref == "p_42"
+        assert res.status == "succeeded"
+
     def test_published_is_succeeded(self, monkeypatch):
         install(monkeypatch, json_route(200, {
             "success": True, "status": "published", "post_id": "p_42",
@@ -447,6 +610,57 @@ class TestSubmitClassification:
             run(status200.PROVIDER.submit(API_KEY, payload()))
         assert exc.value.code in errors.CREDENTIAL_FATAL
 
+    # --- 401: key vs account -------------------------------------------------
+    # Both arrive as a bare 401. Telling them apart is the difference between
+    # taking one destination offline and taking the whole group offline, which is
+    # what happened on 2026-08-17: an expired Instagram session invalidated the
+    # group's API key, and YouTube and TikTok — both healthy — then parked every
+    # post every 15 minutes with nothing shown anywhere.
+    @pytest.mark.parametrize("message", [
+        "The Instagram session has expired, please reconnect the account",
+        "instagram access token is invalid or expired",
+        "Facebook token expired — re-authenticate to continue",
+        "Your TikTok account needs to be linked again: log in again",
+        "youtube: refresh this token",
+    ])
+    def test_an_account_level_401_only_takes_out_that_destination(
+            self, monkeypatch, message):
+        install(monkeypatch, json_route(401, {"message": message}))
+        with pytest.raises(errors.ProviderError) as exc:
+            run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert exc.value.code == errors.E_ACCOUNT_AUTH
+        assert exc.value.code in errors.DESTINATION_FATAL
+        # The load-bearing half: the group's key must survive this.
+        assert exc.value.code not in errors.CREDENTIAL_FATAL
+        assert exc.value.retryable is False
+
+    @pytest.mark.parametrize("message", [
+        "invalid key",
+        "Unauthorized",
+        "API key not found",
+        "invalid api token for this account",   # names no platform -> key
+        "Your api key has expired",             # expiry wording, still the key
+    ])
+    def test_a_key_level_401_still_takes_out_the_whole_group(
+            self, monkeypatch, message):
+        install(monkeypatch, json_route(401, {"message": message}))
+        with pytest.raises(errors.ProviderError) as exc:
+            run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert exc.value.code == errors.E_AUTH
+        assert exc.value.code in errors.CREDENTIAL_FATAL
+
+    def test_account_detail_nested_below_the_message_field_still_counts(
+            self, monkeypatch):
+        # The classifier reads the raw body too, because this detail has been
+        # seen under a field _message() does not look at. Missing it is the
+        # expensive direction, so the wide read is deliberate.
+        install(monkeypatch, json_route(401, {
+            "message": "Unauthorized",
+            "error": {"detail": "the instagram session has expired"}}))
+        with pytest.raises(errors.ProviderError) as exc:
+            run(status200.PROVIDER.submit(API_KEY, payload()))
+        assert exc.value.code == errors.E_ACCOUNT_AUTH
+
     def test_a_submit_timeout_is_ambiguous_and_never_auto_retried(
             self, monkeypatch):
         # THE dangerous case: the provider may have accepted and published. A
@@ -546,7 +760,16 @@ class TestCapabilitiesAndLookups:
         assert caps.supports_status_lookup is False
         assert caps.supports_cancel_scheduled is False
         assert caps.supports_account_listing is False
+        # Remote scheduling is declared FALSE despite being documented
+        # (`post.scheduledFor`, v1.4.0), because three real posts measured it
+        # being accepted and discarded — the last of them in the exact documented
+        # `...000Z` shape, and a probe of both hosts found one handler with no
+        # other endpoint where scheduling could live. At True the orchestrator
+        # releases every attempt for immediate submit, so a spaced plan fires all
+        # at once; at False our own clock holds the slots. See the capability
+        # block in status200.py for the dated evidence.
         assert caps.supports_remote_schedule is False
+        assert status200.PROVIDER.remote_schedule_ok() is True
         assert caps.supports_webhooks is True
         assert caps.one_platform_per_request is True
         assert caps.media_by_url is True

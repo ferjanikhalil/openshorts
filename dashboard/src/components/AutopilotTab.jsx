@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Bot, Upload, Link2, Plus, X, Play, Square, Loader2, Check,
-  AlertTriangle, ChevronDown, Download, Settings2, Share2, Calendar,
+  AlertTriangle, ChevronDown, Download, Settings2, Share2, Calendar, Clock,
   Instagram, Youtube, Video,
 } from 'lucide-react';
 import { apiFetch, apiJson, uploadAutopilotSource } from '../lib/api';
-import { publishingHealth, listGroups, listDestinations, PLATFORM_LABELS } from '../lib/publishing';
+import { publishingHealth, listGroups, listDestinations, groupPlanPreview, PLATFORM_LABELS } from '../lib/publishing';
 import HookModal from './HookModal';
 import SubtitleModal from './SubtitleModal';
 import TranslateModal from './TranslateModal';
@@ -259,7 +259,12 @@ export default function AutopilotTab({ geminiApiKey, llmConfig, elevenLabsKey, u
   const [autoPostPlatforms, setAutoPostPlatforms] = useState([]); // platform filter
   const [autoPostClipMode, setAutoPostClipMode] = useState('all'); // 'all' | 'first_n'
   const [autoPostMaxClips, setAutoPostMaxClips] = useState(5);
-  const [autoPostSchedule, setAutoPostSchedule] = useState('immediate'); // 'immediate' | 'spread'
+  const [autoPostSchedule, setAutoPostSchedule] = useState('immediate'); // 'immediate' | 'spread' | 'rhythm'
+
+  // Rhythm preview: the next slots each selected group would actually book,
+  // computed server-side by the same pure function the scheduler runs — so
+  // what the operator sees here is what will happen.
+  const [rhythmPreviews, setRhythmPreviews] = useState({}); // group id -> preview|null
 
   // Publishing availability: fetched on mount, determines whether the
   // auto-post section is shown at all.
@@ -303,6 +308,20 @@ export default function AutopilotTab({ geminiApiKey, llmConfig, elevenLabsKey, u
   // Check publishing availability and fetch groups on mount.
   // Only shown when PUBLISHING_ENABLED is true server-side.
   useEffect(() => {
+    // Rhythm schedule preview (fires when the rhythm option is selected).
+    if (autoPostSchedule !== 'rhythm') { setRhythmPreviews({}); return; }
+    let cancelled = false;
+    const withPlan = groups.filter(g => autoPostGroups.includes(g.id) && g.plan);
+    if (!withPlan.length) { setRhythmPreviews({}); return; }
+    Promise.all(withPlan.map(g =>
+      groupPlanPreview(g.id, 3).then(p => [g.id, p]).catch(() => [g.id, null])
+    )).then((entries) => {
+      if (!cancelled) setRhythmPreviews(Object.fromEntries(entries));
+    });
+    return () => { cancelled = true; };
+  }, [autoPostSchedule, autoPostGroups, groups]);
+
+  useEffect(() => {
     let cancelled = false;
     publishingHealth().then((health) => {
       if (!cancelled && health?.enabled) {
@@ -312,7 +331,18 @@ export default function AutopilotTab({ geminiApiKey, llmConfig, elevenLabsKey, u
         // and extract group_ids from the destination list.
         listGroups().then((grps) => {
           if (!cancelled && grps?.groups) {
-            setGroups(grps.groups.map(g => ({ id: g.id, name: g.name || g.id })));
+            setGroups(grps.groups.map(g => ({
+              id: g.id,
+              name: g.name || g.id,
+              // Posting rhythm + credential presence feed the agent page's
+              // preflight and the rhythm schedule preview.
+              plan: g.settings?.plan || null,
+              // A rejected key is stored but unusable, so it must not count as
+              // having one — otherwise preflight passes and every clip parks.
+              hasCredential: !!g.credential && !g.credential.invalid,
+              credentialRejected: !!g.credential?.invalid,
+              enabled: g.enabled !== false,
+            })));
           }
         }).catch((adminErr) => {
           if (cancelled) return;
@@ -475,7 +505,27 @@ export default function AutopilotTab({ geminiApiKey, llmConfig, elevenLabsKey, u
     if (autoPostPlatforms.length) plan.platforms = autoPostPlatforms;
     if (autoPostClipMode === 'first_n') plan.max_clips = autoPostMaxClips;
     if (autoPostSchedule === 'spread') plan.schedule = 'spread';
+    // 'rhythm': each selected group places these clips on its own posting
+    // plan (start time, interval, daily cap) — batch-wide, quota-aware, and
+    // handed to the provider's own scheduler when it supports that.
+    if (autoPostSchedule === 'rhythm') plan.schedule = 'rhythm';
     return plan;
+  };
+
+  // Preflight for the Review & Run card: the cheap config problems that turn
+  // into 3 a.m. failures, surfaced at submit time instead.
+  const publishPreflight = () => {
+    if (!autoPostOn) return [];
+    const out = [];
+    for (const g of groups.filter(x => autoPostGroups.includes(x.id))) {
+      if (!g.enabled) out.push(`Group “${g.name}” is disabled — its clips will not publish.`);
+      if (g.credentialRejected)
+        out.push(`Group “${g.name}” has an API key the provider rejected — re-check or replace it in the Publishing tab. Clips will queue but not post.`);
+      else if (!g.hasCredential) out.push(`Group “${g.name}” has no API key — add one in the Publishing tab.`);
+      if (autoPostSchedule === 'rhythm' && !g.plan)
+        out.push(`Group “${g.name}” has no posting plan — its clips publish as soon as ready. Set a rhythm in the Publishing tab.`);
+    }
+    return out;
   };
 
   // ---- run ---------------------------------------------------------------
@@ -652,6 +702,8 @@ export default function AutopilotTab({ geminiApiKey, llmConfig, elevenLabsKey, u
             setAutoPostSchedule={setAutoPostSchedule}
             publishingAvailable={publishingAvailable}
             groups={groups}
+            rhythmPreviews={rhythmPreviews}
+            publishPreflight={publishPreflight}
           />
         ) : (
           <BoardView
@@ -746,7 +798,7 @@ function SetupView(props) {
     autoPostOn, setAutoPostOn, autoPostGroups, setAutoPostGroups,
     autoPostPlatforms, setAutoPostPlatforms, autoPostClipMode, setAutoPostClipMode,
     autoPostMaxClips, setAutoPostMaxClips, autoPostSchedule, setAutoPostSchedule,
-    publishingAvailable, groups,
+    publishingAvailable, groups, rhythmPreviews, publishPreflight,
   } = props;
 
   const chips = [
@@ -1066,7 +1118,7 @@ function SetupView(props) {
               {/* Scheduling */}
               <div>
                 <p className="eyebrow mb-2">Posting schedule</p>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-3 gap-2">
                   <button
                     onClick={() => setAutoPostSchedule('immediate')}
                     className={`py-3 px-2 rounded-input border flex flex-col items-center gap-1 transition-colors ${
@@ -1089,11 +1141,63 @@ function SetupView(props) {
                     }`}
                   >
                     <span className="block font-mono text-sm leading-none flex items-center gap-1.5">
-                      <Calendar size={12} /> Spread over time
+                      <Calendar size={12} /> Spread
                     </span>
                     <span className="block text-[10px] leading-tight text-center text-muted">Stagger posts</span>
                   </button>
+                  <button
+                    onClick={() => setAutoPostSchedule('rhythm')}
+                    className={`py-3 px-2 rounded-input border flex flex-col items-center gap-1 transition-colors ${
+                      autoPostSchedule === 'rhythm'
+                        ? 'border-[color:var(--color-accent)] text-ink'
+                        : 'border-rule2 text-muted hover:border-[color:var(--color-accent)]'
+                    }`}
+                  >
+                    <span className="block font-mono text-sm leading-none flex items-center gap-1.5">
+                      <Clock size={12} /> Rhythm
+                    </span>
+                    <span className="block text-[10px] leading-tight text-center text-muted">Each group's plan</span>
+                  </button>
                 </div>
+
+                {autoPostSchedule === 'rhythm' && (
+                  <div className="mt-2 space-y-2">
+                    {groups.filter(g => autoPostGroups.includes(g.id)).map((g) => {
+                      const preview = rhythmPreviews[g.id];
+                      const slots = preview?.slots || [];
+                      return (
+                        <div key={g.id} className="p-2.5 rounded-input bg-paper3 border border-rule">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs text-ink font-medium">{g.name}</span>
+                            {g.plan ? (
+                              <span className="text-[11px] text-muted font-mono">
+                                {g.plan.start_time || '06:00'} · every {g.plan.interval_hours || 6}h · max {g.plan.max_per_day || 3}/day
+                              </span>
+                            ) : (
+                              <span className="text-[11px] text-warn">no plan set — posts when ready</span>
+                            )}
+                          </div>
+                          {slots.length > 0 && (
+                            <div className="mt-1.5 flex flex-wrap gap-1.5">
+                              {slots.map((s) => (
+                                <span key={s} className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-paper2 border border-rule text-muted">
+                                  {new Date(s).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {g.plan && preview === null && (
+                            <p className="text-[10px] text-muted mt-1">preview unavailable (admin token not set)</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                    <p className="text-[11px] text-muted">
+                      Clips queue on each group's rhythm across the whole run — quota-aware, no collisions,
+                      and scheduled on the provider so this machine can be offline at posting time.
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1119,6 +1223,15 @@ function SetupView(props) {
                 {framingOverrideCount === 1 ? '' : 's'} customised</span>
             )}
           </p>
+          {publishingAvailable && autoPostOn && publishPreflight().length > 0 && (
+            <div className="mt-2 pt-2 border-t border-rule space-y-1">
+              {publishPreflight().map((w) => (
+                <p key={w} className="text-xs text-warn flex items-start gap-1.5">
+                  <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}
+                </p>
+              ))}
+            </div>
+          )}
           {paidOps.length > 0 ? (
             <div className="mt-2 pt-2 border-t border-rule space-y-1">
               {paidOps.map((op) => (
@@ -1390,6 +1503,8 @@ function VideoBoardCard({ video, geminiApiKey, elevenLabsKey, uploadPostKey, upl
   const [publishGroups, setPublishGroups] = useState([]);
   const [publishPlatforms, setPublishPlatforms] = useState([]);
   const [publishMaxClips, setPublishMaxClips] = useState(5);
+  // 'immediate' posts now; 'rhythm' queues on each selected group's plan.
+  const [publishSchedule, setPublishSchedule] = useState('immediate');
   const [publishing, setPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState(null);
 
@@ -1411,7 +1526,7 @@ function VideoBoardCard({ video, geminiApiKey, elevenLabsKey, uploadPostKey, upl
         group_ids: publishGroups,
         platforms: publishPlatforms,
         max_clips: publishMaxClips,
-        schedule: 'immediate',
+        schedule: publishSchedule,
       };
       const res = await apiFetch(`/api/autopilot/${batchId}/publish`, {
         method: 'POST',
@@ -1550,6 +1665,34 @@ function VideoBoardCard({ video, geminiApiKey, elevenLabsKey, uploadPostKey, upl
                   onChange={(e) => setPublishMaxClips(parseInt(e.target.value) || 5)}
                   className="w-20 px-2 py-1 text-xs border border-rule rounded-input"
                 />
+              </div>
+
+              {/* Schedule */}
+              <div>
+                <label className="text-[11px] text-muted block mb-1">Schedule</label>
+                <div className="flex gap-1">
+                  {[
+                    { value: 'immediate', label: 'Post now' },
+                    { value: 'rhythm', label: "Groups' rhythm" },
+                  ].map((opt) => (
+                    <button
+                      key={opt.value}
+                      onClick={() => setPublishSchedule(opt.value)}
+                      className={`px-2 py-0.5 text-[11px] rounded-full border transition-colors ${
+                        publishSchedule === opt.value
+                          ? 'bg-brass/15 border-brass text-brass'
+                          : 'border-rule text-muted hover:text-ink'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                {publishSchedule === 'rhythm' && (
+                  <p className="text-[10px] text-muted mt-1">
+                    Clips queue on each group's posting plan (set in the Publishing tab).
+                  </p>
+                )}
               </div>
 
               {/* Publish button */}

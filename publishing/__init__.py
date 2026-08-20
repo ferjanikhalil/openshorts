@@ -21,8 +21,37 @@ three code paths.
 Wiring mirrors ``cloud/`` (Starlette forbids adding middleware after start):
   - ``setup_sync(app)``  -> import time (routers)
   - ``setup_async(app)`` -> lifespan (DB engine, background loops)
+
+There are two other entrypoints, both for a host that holds the schedule clock
+because this one may be asleep at a slot (see ``deploy/publisher/README.md``):
+``runner.py`` for an always-on process, ``tick.py`` for a scheduled one.
 """
+import sys
+
 from .config import is_enabled, settings, validate_required  # noqa: F401
+
+
+def make_stdio_utf8_safe() -> None:
+    """Stop a log character from aborting the boot.
+
+    Publishing's boot lines carry emoji, and a Windows console defaults to
+    cp1252, which cannot encode them: ``print`` raises UnicodeEncodeError and the
+    process dies before the first loop starts. Inside a Linux container this
+    never happens, but the obvious way to smoke-test either entrypoint before
+    deploying anything is to run it on a laptop — and dying there with a codec
+    error, on the very first warning, is a terrible first impression of a
+    component whose whole job is to be dependable.
+
+    Called by the entrypoints, not at import: ``app.py`` owns its own stdio.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - not a text stream
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # pragma: no cover - already redirected somewhere odd
+            pass
 
 
 def setup_sync(app):
@@ -53,4 +82,8 @@ async def setup_async(app):
         print(f"⚠️  {warning}")
     await worker.recover_stale_on_boot()
     worker.start_loops()
-    print("📡 Publishing mode ENABLED (DB ready, dispatcher + reconciler active).")
+    # The media strategy belongs in the boot line: it decides whether the
+    # provider's download crosses this machine's uplink, which is the difference
+    # between a post going out and a submit timing out into `unknown`.
+    print("📡 Publishing mode ENABLED (DB ready, dispatch + reconcile + "
+          f"transfer active, media: {media.media_strategy()}).")

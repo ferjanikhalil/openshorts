@@ -113,12 +113,16 @@ async def health():
             "token": admin_auth.token_auth_available(),
             "email": admin_auth.email_auth_available(),
         },
-        "media_strategy": "r2_presigned" if media.r2_available()
-                          else ("signed_token" if settings.public_base_url
-                                else "none"),
+        "media_strategy": media.media_strategy(),
         "clip_resolver_registered": clips.has_resolver(),
+        # `publisher` means this instance holds the clock but no clip files, so a
+        # missing resolver is the design and not a fault. Without the distinction
+        # an always-on publisher reports unhealthy for its whole life and sends
+        # the operator hunting a phantom.
+        "role": settings.role,
         "warnings": warnings,
-        "ok": not warnings and clips.has_resolver(),
+        "ok": not warnings and (clips.has_resolver()
+                                or settings.role == "publisher"),
     }
 
 
@@ -182,8 +186,19 @@ async def _preflight(session, dest: PublishDestination,
 
     cred = await service.active_credential(session, dest.publish_group_id)
     if cred is None:
-        blockers.append("this group has no usable API key — add one in "
-                        "publishing settings")
+        # Still a blocker either way — but "add one" is wrong advice when a key
+        # is already there and the provider rejected it, so name the real state.
+        rejected = await service.active_credential(
+            session, dest.publish_group_id, include_invalid=True)
+        if rejected is not None:
+            detail = (f": {rejected.invalid_reason[:200]}"
+                      if rejected.invalid_reason else "")
+            blockers.append("the provider rejected this group's API key — "
+                            "re-check or replace it in publishing settings"
+                            + detail)
+        else:
+            blockers.append("this group has no usable API key — add one in "
+                            "publishing settings")
 
     if dest.cooldown_until and dest.cooldown_until > _now():
         warnings.append(f"provider cooldown until {dest.cooldown_until.isoformat()}")
@@ -229,7 +244,7 @@ async def preview(body: PublishPreview, request: Request,
             "duration": (info or {}).get("duration"),
             "fingerprint": (info or {}).get("fingerprint"),
         } if (body.job_id is not None) else None,
-        "media_ready": bool(media.r2_available() or settings.public_base_url),
+        "media_ready": media.media_strategy() != "none",
     }
 
 
@@ -509,7 +524,11 @@ async def list_attempts(request: Request,
 
 
 # --- Signed media -----------------------------------------------------------
-@router.get("/media/{token}")
+# HEAD as well as GET: downloaders probe with HEAD before fetching (Status 200's
+# does), and FastAPI does NOT add HEAD to a @router.get route — so the probe got
+# a 405 and the fetch looked broken before it started. FileResponse handles the
+# bodyless case itself.
+@router.api_route("/media/{token}", methods=["GET", "HEAD"])
 async def serve_media(token: str):
     """Serve ONE clip to the provider, gated by an HMAC token.
 
@@ -518,7 +537,10 @@ async def serve_media(token: str):
     filename and an expiry, so it grants exactly one file for a bounded time and
     cannot be edited into a path traversal — a changed filename changes the MAC.
 
-    Cloud deploys never reach this route; R2 presigned URLs are preferred there.
+    The slow route by construction: the provider downloads the whole clip from
+    here, inside its own submit request. Deploys with an object store configured
+    (see publishing/objectstore.py) never reach it, and neither do cloud deploys,
+    which prefer R2 presigned URLs.
     """
     ok, payload, reason = media.verify_media_request(token)
     if not ok:

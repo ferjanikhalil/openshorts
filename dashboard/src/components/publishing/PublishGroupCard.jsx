@@ -5,6 +5,7 @@ import {
 import { updateGroup, deleteGroup } from '../../lib/publishing';
 import CredentialForm from './CredentialForm';
 import DestinationList from './DestinationList';
+import PostingPlanEditor from './PostingPlanEditor';
 
 // PublishGroupCard — one group: its key, its accounts, its state.
 //
@@ -13,7 +14,10 @@ import DestinationList from './DestinationList';
 // groups, and every attempt row names its own destination. This card is the
 // place the operator configures the bundle, nothing more.
 export default function PublishGroupCard({ group, platforms, onChanged }) {
-  const [open, setOpen] = useState(!group.credential || !group.destinations?.length);
+  // Open by default when something needs doing — including a key the provider
+  // rejected, which is just as publish-stopping as a missing one.
+  const [open, setOpen] = useState(
+    !group.credential || group.credential.invalid || !group.destinations?.length);
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(group.name);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -141,6 +145,10 @@ export default function PublishGroupCard({ group, platforms, onChanged }) {
 
       {open && (
         <div className="mt-4 space-y-5 border-t border-rule pt-4">
+          <section>
+            <p className="eyebrow mb-2">posting plan</p>
+            <PostingPlanEditor group={group} onChanged={onChanged} />
+          </section>
           <section>
             <p className="eyebrow mb-2">credential</p>
             <CredentialForm group={group} onSaved={onChanged} />

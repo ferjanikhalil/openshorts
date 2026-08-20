@@ -205,3 +205,89 @@ class TestPlatformLimits:
     def test_missing_caption_is_not_an_error(self):
         assert plat.check_caption(plat.TIKTOK, None) is None
         assert plat.check_caption(plat.TIKTOK, "") is None
+
+
+class TestRhythmPlan:
+    def test_non_rhythm_plan_normalizes_to_none(self):
+        assert schedule.normalize_plan(None) is None
+        assert schedule.normalize_plan({}) is None
+        assert schedule.normalize_plan({"mode": "immediate"}) is None
+
+    def test_defaults_fill_in(self):
+        plan = schedule.normalize_plan({"mode": "rhythm"})
+        assert plan["start_time"] == "06:00"
+        assert plan["interval_hours"] == 6.0
+        assert plan["max_per_day"] == 3
+        assert plan["timezone"] == "UTC"
+        assert plan["catch_up"] == "next_slot"
+
+    @pytest.mark.parametrize("bad", [
+        {"start_time": "25:00"}, {"start_time": "6am"},
+        {"interval_hours": 0}, {"interval_hours": 30},
+        {"max_per_day": 0}, {"max_per_day": 40},
+        {"timezone": "Mars/Olympus"}, {"catch_up": "yolo"},
+    ])
+    def test_bad_input_raises(self, bad):
+        with pytest.raises(ValueError):
+            schedule.normalize_plan({"mode": "rhythm", **bad})
+
+    def test_stagger_is_deterministic_and_bounded(self):
+        a = schedule.stagger_for_group("some-group-id")
+        b = schedule.stagger_for_group("some-group-id")
+        assert a == b and 0 <= a < 15
+
+
+class TestRhythmSlots:
+    PLAN = {"mode": "rhythm", "start_time": "06:00", "interval_hours": 6,
+            "max_per_day": 3, "timezone": "UTC"}
+
+    def test_grid_starts_at_next_slot(self):
+        # 10:00 UTC -> today's 06:00 passed; next is 12:00, then 18:00, then
+        # tomorrow 06:00 — an interval step across midnight restarts at the
+        # start time instead of emitting a midnight slot.
+        out = schedule.rhythm_slots(self.PLAN, 3, now=at(10), group_id="g")
+        assert [t.hour for t in out["slots"]] == [12, 18, 6]
+        assert out["slots"][2].day == 11
+
+    def test_daily_cap_spills_to_next_day(self):
+        # 4 posts, cap 3/day, starting at 07:00 with today's slots ahead:
+        # 07,13,19 today then tomorrow 07.
+        plan = dict(self.PLAN, interval_hours=6, start_time="07:00")
+        out = schedule.rhythm_slots(plan, 4, now=at(5), group_id="g")
+        days = [t.day for t in out["slots"]]
+        assert days == [10, 10, 10, 11]
+
+    def test_booked_slots_count_against_the_cap(self):
+        # Two posts already booked today -> only one slot left today.
+        booked = [at(7), at(13)]
+        plan = dict(self.PLAN, start_time="07:00")
+        out = schedule.rhythm_slots(plan, 2, now=at(14), booked=booked,
+                                    group_id="g")
+        # 19:00 is free today (cap 3, two used); the next is tomorrow 07:00.
+        assert out["slots"][0].hour == 19
+        assert out["slots"][1].day == 11
+
+    def test_daily_cap_argument_tightens_further(self):
+        plan = dict(self.PLAN, start_time="07:00")
+        out = schedule.rhythm_slots(plan, 2, now=at(5), daily_cap=1,
+                                    group_id="g")
+        assert out["slots"][0].day == 10
+        assert out["slots"][1].day == 11
+
+    def test_timezone_localizes_the_grid(self):
+        # 06:00 Cairo is 03:00 UTC in August (UTC+3, no DST).
+        plan = dict(self.PLAN, timezone="Africa/Cairo")
+        out = schedule.rhythm_slots(plan, 1, now=at(0), group_id="g")
+        assert out["slots"][0].hour == 3
+
+    def test_slots_are_utc_and_aware(self):
+        out = schedule.rhythm_slots(self.PLAN, 1, now=at(10), group_id="g")
+        t = out["slots"][0]
+        assert t.tzinfo is not None
+        assert t.tzinfo == timezone.utc
+
+    def test_slots_respect_minimum_lead_time(self):
+        # A slot in the past can never be emitted, even with bookings that
+        # push the cursor around.
+        out = schedule.rhythm_slots(self.PLAN, 2, now=at(23), group_id="g")
+        assert all(t > at(23) for t in out["slots"])

@@ -24,7 +24,8 @@ from sqlalchemy.exc import IntegrityError
 from . import state
 from .config import BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS, settings
 from .errors import (
-    CREDENTIAL_FATAL, DESTINATION_FATAL, E_QUOTA_EXHAUSTED, ProviderError,
+    CREDENTIAL_FATAL, DESTINATION_FATAL, E_ACCOUNT_AUTH, E_QUOTA_EXHAUSTED,
+    ProviderError,
 )
 from .models import (
     PublishAttempt, PublishCredential, PublishDestination, PublishEvent,
@@ -123,24 +124,32 @@ async def expand_destinations(session, *, destination_ids: Iterable = (),
     return out
 
 
-async def active_credential(session, group_id, kind: str = "api_key"):
+async def active_credential(session, group_id, kind: str = "api_key",
+                            include_invalid: bool = False):
     """Newest usable credential of a kind for a group.
 
     Rotation is by-insert, so "newest active" is the current one; a credential
     the provider has already 401'd is excluded so the dispatcher stops spending
     attempts on a key that is definitively dead.
+
+    ``include_invalid=True`` is for the two callers that must see a rejected key
+    rather than pretend there is none: the admin view (which has to say "this key
+    was rejected, here is why" instead of "no key stored") and the verify
+    endpoint (whose whole job is to clear the flag once the key works again).
+    Dispatch must never pass it — that is what the exclusion is for.
     """
-    row = (await session.execute(
+    stmt = (
         select(PublishCredential)
         .where(PublishCredential.publish_group_id == _as_uuid(group_id),
                PublishCredential.kind == kind,
                PublishCredential.active.is_(True),
-               PublishCredential.revoked_at.is_(None),
-               PublishCredential.invalid_at.is_(None))
+               PublishCredential.revoked_at.is_(None))
         .order_by(PublishCredential.created_at.desc())
         .limit(1)
-    )).scalar_one_or_none()
-    return row
+    )
+    if not include_invalid:
+        stmt = stmt.where(PublishCredential.invalid_at.is_(None))
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 # --- Request creation -------------------------------------------------------
@@ -258,17 +267,29 @@ async def claim_due_attempts(session, worker_id: str, limit: int = 10
 
 
 async def release_claim(session, attempt: PublishAttempt,
-                        defer_seconds: Optional[int] = None) -> None:
+                        defer_seconds: Optional[int] = None,
+                        reason: Optional[str] = None,
+                        code: Optional[str] = None) -> None:
     """Put a claimed attempt back without consuming a try.
 
     Used when dispatch declines to submit (quota, cooldown, missing media) —
     those are not failures of the post and must not count toward max_attempts.
+
+    ``reason`` matters more than it looks. Because this path consumes no try, it
+    has no natural end: an attempt can be re-parked every 15 minutes forever. If
+    it also records nothing, the board shows only "Scheduled · next 12:38" and
+    the operator watches the time march forward with no way to learn why —
+    exactly what happened on 2026-08-17. Any decline a human might have to fix
+    must pass a reason so it lands on the row.
     """
     attempt.status = state.DEFERRED if defer_seconds else state.PENDING
     attempt.claimed_at = None
     attempt.claimed_by = None
     if defer_seconds:
         attempt.deferred_until = _now() + timedelta(seconds=defer_seconds)
+    if reason is not None:
+        attempt.error_code = code
+        attempt.error_message = reason[:2000]
     await session.flush()
 
 
@@ -286,6 +307,11 @@ async def record_success(session, attempt: PublishAttempt, result,
     attempt.quota_snapshot = _jsonable(result.quota)
     attempt.submitted_at = _now()
     attempt.publish_credential_id = credential_id
+    # Any error text on this row described a hold that has now cleared (a quota
+    # wait, a missing key). Leaving it would print a red line under a post that
+    # went out fine.
+    attempt.error_code = None
+    attempt.error_message = None
     if target == state.SUCCEEDED:
         attempt.completed_at = _now()
     elif result.defer_seconds:
@@ -435,9 +461,18 @@ async def _mark_destination_unhealthy(session, attempt, err) -> None:
     dest = await session.get(PublishDestination, attempt.publish_destination_id)
     if dest is None:
         return
-    dest.health = "blocked"
+    # Two different fixes, so two different words. 'blocked' means the reference
+    # is wrong or not permitted (check the account id); 'disconnected' means the
+    # link to the platform lapsed (re-link the account at the provider) — the
+    # same state a profile.disconnected webhook produces. Both are cleared with
+    # "reset health" on the account once the operator has fixed it.
+    disconnected = err.code == E_ACCOUNT_AUTH
+    dest.health = "disconnected" if disconnected else "blocked"
     dest.health_detail = err.message[:500]
-    await log_event(session, "destination.blocked", message=err.message[:500],
+    await log_event(session,
+                    "destination.disconnected" if disconnected
+                    else "destination.blocked",
+                    message=err.message[:500],
                     destination_id=dest.id, group_id=dest.publish_group_id,
                     request_id=attempt.publish_request_id)
 
@@ -639,22 +674,62 @@ async def sweep_stale_submitted(session) -> int:
     return len(rows)
 
 
-async def recover_orphaned_claims(session) -> int:
+def claim_is_recoverable(claimed_at, now, min_age_seconds: int) -> bool:
+    """Is this ``in_flight`` claim old enough to be treated as abandoned?
+
+    Split out as a pure function on purpose. It is the rule that decides whether
+    a row a live worker may still be holding gets handed to a second worker, so
+    it has to be testable without a database — see
+    ``tests/test_publishing_tick.py::TestOrphanRecoveryIsAgeBounded``.
+
+    A claim with no ``claimed_at`` is recoverable immediately: every real claim
+    stamps it (``claim_due_attempts``), so a NULL means the row was left
+    ``in_flight`` by something that never held a proper claim, and no worker is
+    coming back for it.
+    """
+    if claimed_at is None:
+        return True
+    if claimed_at.tzinfo is None:  # pragma: no cover - column is tz-aware
+        claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+    return (now - claimed_at).total_seconds() >= min_age_seconds
+
+
+async def recover_orphaned_claims(session, min_age_seconds: Optional[int] = None
+                                  ) -> int:
     """Return attempts claimed by a worker that died mid-dispatch.
 
-    IN_FLIGHT means "claimed, not yet handed to the provider". On a clean
-    restart nothing is in flight, so any such row is an orphan and safe to
-    re-queue — unlike SUBMITTED, which may correspond to a live post.
+    IN_FLIGHT means "claimed, not yet handed to the provider", so unlike
+    SUBMITTED — which may correspond to a live post — such a row is safe to
+    re-queue *if nobody is still working on it*.
+
+    That last condition used to be free: with one long-lived process, boot meant
+    nothing was in flight. It is not free any more. The app host and the always-on
+    publisher (deploy/publisher/) share this queue, and a publisher that runs as a
+    scheduled tick boots often — so a recovery pass regularly runs while the other
+    process is mid-batch. Re-queuing a claim someone is still working through is
+    how one clip becomes two posts.
+
+    So recovery only takes claims that have gone quiet for
+    ``settings.orphan_claim_min_age_seconds``. The age bound reduces collisions;
+    what makes an early recovery merely wasteful rather than destructive is the
+    claim-ownership check in ``dispatcher.dispatch_attempt``.
     """
+    if min_age_seconds is None:
+        min_age_seconds = settings.orphan_claim_min_age_seconds
     rows = (await session.execute(
         select(PublishAttempt).where(PublishAttempt.status == state.IN_FLIGHT)
         .with_for_update(skip_locked=True)
     )).scalars().all()
+    now = _now()
+    recovered = 0
     for row in rows:
+        if not claim_is_recoverable(row.claimed_at, now, min_age_seconds):
+            continue
         row.status = state.PENDING
         row.claimed_at = None
         row.claimed_by = None
-    return len(rows)
+        recovered += 1
+    return recovered
 
 
 async def group_summary(session, group_id) -> dict:

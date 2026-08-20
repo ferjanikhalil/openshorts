@@ -27,8 +27,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 
 from . import (
-    admin_auth, crypto, db, media, planner, platforms as plat, providers,
-    schedule, service, state, views,
+    admin_auth, crypto, db, media, objectstore, planner, platforms as plat,
+    providers, schedule, service, state, views,
 )
 from .admin_auth import AdminIdentity, require_publishing_admin
 from .config import settings
@@ -89,9 +89,16 @@ def _webhook_url(provider: str) -> Optional[str]:
 
 
 async def _group_payload(session, group: PublishGroup) -> dict:
-    cred = await service.active_credential(session, group.id)
+    # include_invalid: a key the provider rejected still has to appear here.
+    # Without it the card said "No key stored. This group cannot publish until
+    # one is added" for a key that was sitting right there, invalidated — so the
+    # operator had no way to see the real problem or the provider's reason.
+    # views.credential_out already carries `invalid` / `invalid_reason`.
+    cred = await service.active_credential(session, group.id,
+                                          include_invalid=True)
     hook = await service.active_credential(session, group.id,
-                                           kind="webhook_secret")
+                                           kind="webhook_secret",
+                                           include_invalid=True)
     dests = (await session.execute(
         select(PublishDestination)
         .where(PublishDestination.publish_group_id == group.id)
@@ -117,9 +124,10 @@ async def admin_health(ident: AdminIdentity = Depends(require_publishing_admin))
         "providers": providers.describe(),
         "platforms": list(plat.KNOWN_PLATFORMS),
         "max_attempts": settings.max_attempts,
-        "media_strategy": "r2_presigned" if media.r2_available()
-                          else ("signed_token" if settings.public_base_url
-                                else "none"),
+        "media_strategy": media.media_strategy(),
+        # Bucket/endpoint/region only — an admin has to be able to see WHICH
+        # store is in use to debug a staging failure. No key material.
+        "media_store": objectstore.describe(),
         "warnings": list(media.reachability_warnings())
                     + admin_auth.config_warnings(),
     }
@@ -133,6 +141,20 @@ async def list_groups(session=Depends(db.get_db)):
         select(PublishGroup).order_by(PublishGroup.created_at))).scalars().all()
     return {"groups": [await _group_payload(session, g) for g in groups],
             "count": len(groups)}
+
+
+def _validated_settings(settings_in: Optional[dict]) -> Optional[dict]:
+    """Reject a malformed posting plan at write time, with the operator's
+    language, not a stack trace three hours later in the reconciler."""
+    if settings_in is None:
+        return None
+    plan = (settings_in or {}).get("plan")
+    if plan is not None:
+        try:
+            schedule.normalize_plan(plan)
+        except ValueError as e:
+            raise HTTPException(400, f"invalid posting plan: {e}")
+    return settings_in
 
 
 @router.post("/groups", status_code=201)
@@ -153,7 +175,7 @@ async def create_group(body: GroupCreate,
 
     group = PublishGroup(
         name=body.name.strip(), provider=provider, enabled=body.enabled,
-        settings=body.settings or {}, user_id=ident.user_id)
+        settings=_validated_settings(body.settings) or {}, user_id=ident.user_id)
     session.add(group)
     await session.flush()
     await service.log_event(session, "group.created", message=group.name,
@@ -177,7 +199,7 @@ async def update_group(group_id: str, body: GroupUpdate,
     if body.enabled is not None:
         group.enabled = body.enabled
     if body.settings is not None:
-        group.settings = body.settings
+        group.settings = _validated_settings(body.settings)
     await service.log_event(session, "group.updated", message=group.name,
                             group_id=group.id, actor=ident.label)
     await session.commit()
@@ -316,7 +338,12 @@ async def verify_credential(group_id: str, session=Depends(db.get_db)):
     the same non-destructive probe as ``set_credential``; no post is created.
     """
     group = await _get_group(session, group_id)
-    cred = await service.active_credential(session, group.id)
+    # include_invalid: clearing the invalid flag is half of what this endpoint is
+    # for, and an invalidated row is exactly the one it has to load. Without it
+    # the 404 below fired for every rejected key and the recovery path underneath
+    # was unreachable — the only way back was to re-paste the key.
+    cred = await service.active_credential(session, group.id,
+                                          include_invalid=True)
     if cred is None:
         raise HTTPException(404, "this group has no active API key")
 
@@ -614,6 +641,33 @@ async def group_capacity(group_id: str, session=Depends(db.get_db)):
             "platforms": await planner.assignment_capacity(session, group.id)}
 
 
+@router.get("/groups/{group_id}/plan/preview")
+async def group_plan_preview(group_id: str, count: int = Query(6, ge=1, le=30),
+                             session=Depends(db.get_db)):
+    """The next slots this group's rhythm would book, computed the same way
+    the assigner computes them (bookings and quota included).
+
+    This is the honest preview: what it shows is what the reconciler will do,
+    because both call the same pure function on the same inputs.
+    """
+    from datetime import datetime, timezone
+    group = await _get_group(session, group_id)
+    plan = planner.group_plan(group)
+    if plan is None:
+        return {"group_id": str(group.id), "plan": None,
+                "slots": [], "reason": "this group has no posting rhythm"}
+    booked = await planner._group_bookings(session, group.id)
+    daily_cap = await planner._group_daily_cap(session, group.id, plan)
+    result = schedule.rhythm_slots(
+        plan, count, now=datetime.now(timezone.utc), booked=booked,
+        daily_cap=daily_cap, group_id=str(group.id))
+    return {"group_id": str(group.id), "plan": plan,
+            "daily_cap": daily_cap,
+            "booked_count": len(booked),
+            "slots": [t.isoformat() for t in result["slots"]],
+            "per_day": result["per_day"]}
+
+
 @router.post("/schedule/run")
 async def run_scheduler_now(ident: AdminIdentity = Depends(require_publishing_admin)):
     """Force a scheduler pass instead of waiting for the reconciler tick.
@@ -621,10 +675,13 @@ async def run_scheduler_now(ident: AdminIdentity = Depends(require_publishing_ad
     Operationally useful ("I fixed the destination, go now") and it is how the
     assignment path is exercised in a test without a 60-second sleep.
     """
+    from . import dispatcher as dispatcher_mod
     async with db.session() as session:
         async with session.begin():
+            slotted = await planner.assign_rhythm_slots(session)
             converted = await planner.run_due_assignments(session)
-    return {"converted": converted}
+            promoted = await dispatcher_mod.promote_remote_schedules(session)
+    return {"slotted": slotted, "converted": converted, "promoted": promoted}
 
 
 # --- Audit ------------------------------------------------------------------
@@ -648,6 +705,73 @@ async def list_events(group_id: Optional[str] = None,
         stmt.order_by(PublishEvent.created_at.desc()).limit(limit))
     ).scalars().all()
     return {"events": [views.event_out(r) for r in rows], "count": len(rows)}
+
+
+@router.get("/attempts")
+async def list_attempts_raw(request_id: Optional[str] = None,
+                            status: Optional[str] = None,
+                            limit: int = Query(50, ge=1, le=200),
+                            session=Depends(db.get_db)):
+    """Attempts WITH the provider's verbatim response body. Admin only.
+
+    The public ``/attempts`` route deliberately shows the normalized view. This
+    one adds ``provider_response``, because the questions an operator actually
+    has to answer — "the dashboard says this post is scheduled, so why is it
+    live?", "why is there no post ref to match a webhook against?" — are only
+    answerable from what the provider really sent back.
+    """
+    stmt = select(PublishAttempt, PublishDestination).join(
+        PublishDestination,
+        PublishDestination.id == PublishAttempt.publish_destination_id)
+    if request_id:
+        stmt = stmt.where(PublishAttempt.publish_request_id
+                          == _uuid_or_404(request_id, "request"))
+    if status:
+        stmt = stmt.where(PublishAttempt.status == status)
+    rows = (await session.execute(
+        stmt.order_by(PublishAttempt.created_at.desc()).limit(limit))).all()
+    return {"attempts": [views.attempt_out(a, d, include_raw=True)
+                         for a, d in rows], "count": len(rows)}
+
+
+@router.post("/groups/{group_id}/probe")
+async def probe_provider(group_id: str, job_ref: Optional[str] = None,
+                         session=Depends(db.get_db)):
+    """Read-only reconnaissance against the provider. Publishes nothing.
+
+    Optional per provider, like ``check_credential``: providers that expose
+    ``probe_endpoints`` get probed, the rest say so. Nothing here is
+    provider-specific — what to probe is the adapter's business.
+
+    Worth having because this integration has now been wrong twice in the same
+    way: trusting documentation over measurement. Both times a real post paid
+    for it.
+    """
+    group = await _get_group(session, group_id)
+    cred = await service.active_credential(session, group.id,
+                                           include_invalid=True)
+    if cred is None:
+        raise HTTPException(404, "this group has no active API key")
+    try:
+        secret = crypto.decrypt({
+            "key_version": cred.key_version, "nonce_b64": cred.nonce_b64,
+            "ciphertext_b64": cred.ciphertext_b64, "aad": cred.aad})
+    except Exception as e:
+        raise HTTPException(500, crypto.scrub(str(e))[:300])
+
+    provider = providers.get(group.provider)
+    probe = getattr(provider, "probe_endpoints", None)
+    if probe is None:
+        return {"provider": group.provider, "results": None,
+                "detail": "this provider exposes no read-only probe."}
+    results = await probe(secret.reveal(), job_ref=job_ref)
+    # scrub(): a probe reflects provider output verbatim, and verbatim output is
+    # exactly where a credential leaks into a response body or a log line.
+    for entry in results:
+        for field in ("body", "error"):
+            if entry.get(field):
+                entry[field] = crypto.scrub(str(entry[field]))
+    return {"provider": group.provider, "results": results}
 
 
 @router.get("/dry-run")

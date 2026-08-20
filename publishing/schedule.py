@@ -124,3 +124,179 @@ def clip_selection(clip_count: int, *, clip_indexes=None,
     if max_clips:
         idx = idx[:max(0, int(max_clips))]
     return idx
+
+
+# --- Posting rhythm (per-group plan) -----------------------------------------
+# A rhythm is the operator's instruction "this batch starts at 06:00 and posts
+# one clip every N hours, at most M a day" — the schedule equivalent of a
+# recipe. It lives in ``publish_groups.settings['plan']`` and every function
+# here is pure: the same plan, ``now`` and bookings always produce the same
+# slots, which is what makes a preview honest and a test deterministic.
+
+RHYTHM_MODE = "rhythm"
+DEFAULT_RHYTHM_START = "06:00"
+DEFAULT_RHYTHM_INTERVAL_HOURS = 6.0
+# 3/day against the free tier's 5/day leaves headroom of two for retries and
+# manual posts — see the quota note in providers/status200.py.
+DEFAULT_RHYTHM_MAX_PER_DAY = 3
+RHYTHM_CATCHUP_POLICIES = ("next_slot", "skip", "immediate")
+# How far a slot may pass before the catch-up policy engages. Generous on
+# purpose: a dispatch a few minutes late (retry backoff, worker restart) is the
+# rhythm working, not the rhythm broken.
+CATCH_UP_GRACE_SECONDS = 15 * 60
+
+
+def normalize_plan(raw: Optional[dict]) -> Optional[dict]:
+    """Coerce a stored plan into canonical shape, or None when not a rhythm.
+
+    Raises ValueError with an operator-readable message on bad input — the
+    admin API turns it into a 400 — so a typo cannot silently fall back to
+    defaults the operator never chose.
+    """
+    raw = raw or {}
+    if raw.get("mode") != RHYTHM_MODE:
+        return None
+    plan = dict(raw)
+    plan["mode"] = RHYTHM_MODE
+
+    start = str(raw.get("start_time") or DEFAULT_RHYTHM_START).strip()
+    parts = start.split(":")
+    try:
+        h, m = int(parts[0]), int(parts[1] if len(parts) > 1 else 0)
+        assert 0 <= h < 24 and 0 <= m < 60
+    except Exception:
+        raise ValueError(f"start_time must be HH:MM, got {start!r}")
+    plan["start_time"] = f"{h:02d}:{m:02d}"
+
+    try:
+        raw_interval = raw.get("interval_hours")
+        interval = float(raw_interval if raw_interval is not None
+                         else DEFAULT_RHYTHM_INTERVAL_HOURS)
+        assert 0 < interval <= 24
+    except Exception:
+        raise ValueError("interval_hours must be a number between 0 and 24")
+    plan["interval_hours"] = interval
+
+    try:
+        raw_cap = raw.get("max_per_day")
+        cap = int(raw_cap if raw_cap is not None
+                  else DEFAULT_RHYTHM_MAX_PER_DAY)
+        assert 1 <= cap <= 24
+    except Exception:
+        raise ValueError("max_per_day must be an integer between 1 and 24")
+    plan["max_per_day"] = cap
+
+    plan["timezone"] = _valid_timezone(str(raw.get("timezone") or "UTC"))
+
+    catch_up = str(raw.get("catch_up") or "next_slot")
+    if catch_up not in RHYTHM_CATCHUP_POLICIES:
+        raise ValueError(f"catch_up must be one of {RHYTHM_CATCHUP_POLICIES}")
+    plan["catch_up"] = catch_up
+    return plan
+
+
+def _valid_timezone(name: str) -> str:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(name)
+        return name
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        raise ValueError(f"unknown timezone {name!r}")
+
+
+def stagger_for_group(group_id, max_minutes: int = 15) -> int:
+    """Deterministic minute offset so several groups on the same start time do
+    not all submit in the same second.
+
+    Hashed, not random, so a slot preview does not change between renders, and
+    not the group's position in some list, so reordering groups in the UI does
+    not silently move everyone's schedule.
+    """
+    import hashlib
+    digest = hashlib.sha256(str(group_id).encode()).hexdigest()
+    return int(digest[:6], 16) % max(1, max_minutes)
+
+
+def rhythm_slots(plan: dict, count: int, *, now: datetime,
+                 booked: Sequence[datetime] = (),
+                 daily_cap: Optional[int] = None,
+                 group_id: str = "") -> dict:
+    """Times for ``count`` posts on a group's rhythm.
+
+    Returns ``{"slots": [...], "per_day": {iso-date: n}}``. The grid starts at
+    ``start_time`` and steps by ``interval_hours``; a calendar day (in the
+    plan's timezone) never carries more than ``min(max_per_day, daily_cap)``
+    slots INCLUDING already-booked ones, so a second autopilot run lands on
+    free capacity instead of colliding with the first.
+
+    ``now`` is a parameter like everywhere else in this module: the caller owns
+    the clock, tests stay deterministic.
+    """
+    plan = normalize_plan(plan) or {"start_time": DEFAULT_RHYTHM_START,
+                                    "interval_hours":
+                                        DEFAULT_RHYTHM_INTERVAL_HOURS,
+                                    "max_per_day": DEFAULT_RHYTHM_MAX_PER_DAY,
+                                    "timezone": "UTC"}
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(plan["timezone"])
+    cap = min(plan["max_per_day"],
+              daily_cap if daily_cap is not None else plan["max_per_day"])
+
+    start_h, start_m = (int(x) for x in plan["start_time"].split(":"))
+    interval = timedelta(hours=plan["interval_hours"])
+    stagger = timedelta(minutes=stagger_for_group(group_id))
+
+    # Bookings counted against each day's cap, in the plan's tz.
+    used: dict = {}
+    for t in booked:
+        if t is None:
+            continue
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        day = t.astimezone(tz).date().isoformat()
+        used[day] = used.get(day, 0) + 1
+
+    local_now = now.astimezone(tz) if now.tzinfo else now.replace(
+        tzinfo=timezone.utc).astimezone(tz)
+    # Candidate slots are built in naive local time and localized only on
+    # output: arithmetic stays simple, and DST folds are resolved once at the
+    # edge rather than on every comparison.
+    naive_now = local_now.replace(tzinfo=None)
+    from datetime import datetime as _dt
+
+    def day_start(d):
+        return _dt(d.year, d.month, d.day, start_h, start_m) + stagger
+
+    def step(c):
+        """Advance one interval; a step that crosses midnight restarts the next
+        day at ``start_time`` rather than emitting a small-hours slot. The
+        rhythm is "every N hours from the start time", not "every N hours
+        forever" — 06:00/12:00/18:00 must be followed by tomorrow 06:00, never
+        by midnight."""
+        nxt = c + interval
+        if nxt.date() != c.date():
+            nxt = day_start(nxt.date())
+        return nxt
+
+    slots: List[datetime] = []
+    per_day: dict = {}
+    candidate = day_start(naive_now.date())
+    while candidate <= naive_now:
+        candidate = step(candidate)
+
+    guard = 0
+    while len(slots) < count and guard < 400:
+        guard += 1
+        day_key = candidate.date().isoformat()
+        day_cap_left = cap - used.get(day_key, 0)
+        if day_cap_left <= 0:
+            # Tomorrow's first slot; a new day resets the cap.
+            candidate = day_start(candidate.date() + timedelta(days=1))
+            if candidate <= naive_now:
+                candidate = step(candidate)
+            continue
+        slots.append(candidate.replace(tzinfo=tz).astimezone(timezone.utc))
+        per_day[day_key] = per_day.get(day_key, 0) + 1
+        used[day_key] = used.get(day_key, 0) + 1
+        candidate = step(candidate)
+    return {"slots": slots, "per_day": per_day}

@@ -184,7 +184,12 @@ export default function PublishStatusBoard({ jobId = null }) {
                 </div>
 
                 {a.error_message && (
-                  <p className="mt-1 text-xs text-danger">
+                  /* On a deferred/pending row this text is a hold, not a
+                     failure — the post is still queued. Red there reads as
+                     "this post died", which is the opposite of the truth. */
+                  <p className={`mt-1 text-xs ${
+                    ['deferred', 'pending'].includes(a.status) ? 'text-warn' : 'text-danger'
+                  }`}>
                     {a.error_code ? `${a.error_code}: ` : ''}{a.error_message}
                   </p>
                 )}
