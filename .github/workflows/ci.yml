@@ -18,11 +18,16 @@ jobs:
       # instead of the full requirements.txt (faster-whisper/ultralytics/
       # mediapipe are too heavy for CI). sqlalchemy is needed because
       # tests/test_metering_free_plan.py imports cloud.metering; cryptography
-      # because tests/test_publishing_crypto.py exercises credential sealing.
+      # because tests/test_publishing_crypto.py exercises credential sealing;
+      # fastapi because publishing/runner.py IS a FastAPI app and
+      # publishing/worker.py reaches the webhook drain through publishing/
+      # webhooks.py, so tests/test_publishing_{runner,tick}.py cannot import
+      # their subject without it. It is a real dependency of the publisher
+      # image too (deploy/publisher/requirements.txt), not a test-only one.
       # The publishing tests need no Postgres and no credential — the provider
       # suite runs against httpx.MockTransport and the in-repo fake adapter.
       - name: Install test dependencies
-        run: pip install pytest pillow httpx pydantic sqlalchemy cryptography
+        run: pip install pytest pillow httpx pydantic sqlalchemy cryptography fastapi
       - name: Run tests
         run: pytest tests/ -v
 
