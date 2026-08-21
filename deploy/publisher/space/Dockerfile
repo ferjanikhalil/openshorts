@@ -1,5 +1,12 @@
 # OpenShorts publisher — Hugging Face Docker Space
 #
+# UNUSED as of 2026-08-20, kept only in case the gate lifts: `/new-space` now
+# requires PRO for every SDK that runs compute ("Gradio and Docker Spaces require
+# a paid plan"), so this file cannot be deployed on a free account. The live
+# artifact is the sibling `../Dockerfile`, which builds from a repo root — which is
+# how every host that clones a repository builds. This one exists only because a
+# Space has no repository to build from, hence the tarball fetch below.
+#
 # Copy THIS FILE and README.md into the Space repository. Nothing else: the
 # source is fetched from the public GitHub repo at build time, so the Space holds
 # no second copy of `publishing/` to drift out of date. Rebuilding the Space is
@@ -13,12 +20,25 @@ FROM python:3.11-slim
 # A branch, tag, or commit SHA. Spaces build with no custom build args, so this
 # default is what actually gets used — pin a SHA by editing this line in the
 # Space repo when you want a build you can reproduce.
-ARG REPO=mutonby/openshorts
+#
+# THIS MUST BE THE REPO YOU ACTUALLY PUSH TO. The working tree has two remotes —
+# `khalil` (ferjanikhalil/openshorts, which the branch tracks) and `origin`
+# (mutonby/openshorts, a divergent line with no publishing/ at all). Both are
+# public, so a wrong value here fails at the `cp` below rather than at the
+# download, which reads like a Dockerfile bug instead of a wrong source. Confirm
+# with the API check in the runbook's Step 0 before a first build.
+ARG REPO=ferjanikhalil/openshorts
 ARG REF=main
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    # Same reason as the sibling Dockerfile: this image is only ever the clock
+    # half of a split deployment, so declare it here rather than leaving it to a
+    # secret an operator can forget. The default is `full`, and a publisher
+    # reporting `full` is judged DEAD by the heartbeat Worker — which then alerts
+    # every ten minutes forever about a service that is publishing fine.
+    PUBLISHING_ROLE=publisher
 
 WORKDIR /app
 

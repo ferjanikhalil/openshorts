@@ -27,6 +27,12 @@ output/
 # Secrets
 .env
 
+# Database dumps. The publishing migration produces one containing the
+# publish_credentials rows and the whole audit trail, and this repo is public.
+# Keep dumps outside the working tree anyway; this is the second line of defence.
+*.sql
+*.dump
+
 # Generated metadata
 *_metadata.json
 

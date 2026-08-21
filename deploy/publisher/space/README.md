@@ -11,12 +11,17 @@ short_description: Always-on publishing clock for OpenShorts
 
 # OpenShorts publisher
 
+> **Unused as of 2026-08-20.** Hugging Face now requires PRO for every Space SDK
+> that runs compute, so this cannot be deployed on a free account. Kept in case
+> that changes. The live deployment uses `deploy/publisher/Dockerfile` on a free
+> container host instead — see the runbook linked at the bottom.
+
 Not a demo — there is no UI here. This Space is a scheduling clock. It holds
-publish slots for [OpenShorts](https://github.com/mutonby/openshorts) and submits
-each clip to its social destination when the slot arrives, because no provider in
-the chain will hold a schedule on our behalf: Status 200 accepts a `scheduledFor`
-field and posts immediately anyway, and TikTok's and Instagram's APIs expose no
-scheduled publish at all.
+publish slots for [OpenShorts](https://github.com/ferjanikhalil/openshorts) and
+submits each clip to its social destination when the slot arrives, because no
+provider in the chain will hold a schedule on our behalf: Status 200 accepts a
+`scheduledFor` field and posts immediately anyway, and TikTok's and Instagram's
+APIs expose no scheduled publish at all.
 
 The video pipeline — GPU, models, clip files — stays on the machine that made the
 clips. This Space needs none of it, because a submit needs no bytes: the provider
@@ -61,4 +66,4 @@ reaching a real audience.
 The image fetches the source from GitHub at build time, so this Space repo holds
 only the `Dockerfile` and this README. To pick up a code change: push to the
 branch, then **Settings → Factory rebuild**. Full runbook:
-[`deploy/publisher/README.md`](https://github.com/mutonby/openshorts/blob/main/deploy/publisher/README.md).
+[`deploy/publisher/README.md`](https://github.com/ferjanikhalil/openshorts/blob/main/deploy/publisher/README.md).

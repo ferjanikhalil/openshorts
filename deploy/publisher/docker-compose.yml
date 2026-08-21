@@ -65,7 +65,9 @@ services:
     environment:
       - PUBLISHING_ENABLED=1
       # Declares "no clip files here, on purpose" so /api/publishing/health can
-      # tell that apart from a resolver that failed to register.
+      # tell that apart from a resolver that failed to register. Redundant since
+      # the Dockerfile sets it too — kept because it belongs in the description of
+      # what this service IS, and because that is where someone looks for it.
       - PUBLISHING_ROLE=publisher
       # In-network, so this never crosses the tailnet or the internet. A password
       # with @ / : / # in it would corrupt this URL — generate a hex one.

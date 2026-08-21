@@ -38,7 +38,12 @@ services:
         condition: service_healthy
     environment:
       - PUBLISHING_ENABLED=true
-      - DATABASE_URL=postgresql+asyncpg://openshorts:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set when publishing is enabled}@db:5432/openshorts
+      # Defaults to the local `db` above. Set DATABASE_URL in .env to point this
+      # host at a shared Postgres instead (deploy/publisher/README.md, Step 4).
+      # The ${DATABASE_URL:-…} form is load-bearing: compose `environment:` wins
+      # over .env, so without it a DATABASE_URL in .env is silently ignored and
+      # the backend keeps using the local database while looking correct.
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://openshorts:${POSTGRES_PASSWORD}@db:5432/openshorts}
       # 32 bytes, base64. Generate once and keep it: losing it means every stored
       # credential has to be re-entered.
       #   python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
