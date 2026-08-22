@@ -118,7 +118,14 @@ class Settings:
 
     @property
     def admin_token(self) -> str:
-        return os.environ.get("PUBLISHING_ADMIN_TOKEN", "")
+        # Stripped, exactly like admin_emails above. This value gets pasted into a
+        # host's environment UI — Render's is a multi-line textarea — where a
+        # trailing newline is invisible on screen and fatal in effect: _check_token
+        # uses hmac.compare_digest, an exact byte match, so the operator compares
+        # the two values, sees them agree character for character, and cannot
+        # explain the 401. Cost hours on 2026-08-22. Whitespace around a service
+        # credential is never intentional.
+        return os.environ.get("PUBLISHING_ADMIN_TOKEN", "").strip()
 
     # --- Media reachability ---
     @property
