@@ -3,10 +3,12 @@
  *
  * Why this exists
  * ---------------
- * The publisher runs on a free Hugging Face Space, which sleeps on inactivity.
- * Sleeping is the exact failure the whole split deployment exists to remove: a
- * slot that arrives while the publisher is asleep is a post that does not go out.
- * This worker's only job is to make the Space never idle. One `fetch` every ten
+ * The publisher runs on a free container host (Render, as of 2026-08-21) which
+ * spins down on inactivity. Sleeping is the exact failure the whole split
+ * deployment exists to remove: a slot that arrives while the publisher is asleep
+ * is a post that does not go out — measured, not theoretical, on 2026-08-21, when
+ * a rehearsal slot was claimed by the laptop because the publisher was down.
+ * This worker's only job is to make the host never idle. One `fetch` every ten
  * minutes is enough, and it costs milliseconds of CPU — which is the entire
  * reason the clock lives on Cloudflare and the work does not. Workers cap CPU at
  * 10 ms per invocation on the free plan; waiting on the network is not CPU, so a
@@ -19,13 +21,15 @@
  *
  * What "healthy" means here, and why it is NOT `ok`
  * ------------------------------------------------
- * The publisher deliberately runs with no admin identity, so the credential
- * endpoints are unreachable from its public URL. `config_warnings()` therefore
- * always contains one warning, and `health.ok` is `not warnings and …` — so `ok`
- * is permanently `false` BY DESIGN. A monitor that alerted on `ok` would fire
- * every ten minutes forever and be muted within a day. Liveness here is instead:
- * HTTP 200, a parseable body, and `role == "publisher"` (which also proves we
- * reached our own app and not a captive portal or a holding page).
+ * `health.ok` is `not warnings and …`, so it reports configuration tidiness, not
+ * liveness — and which warnings are expected depends on how the host happens to
+ * be configured. On a publisher with no admin identity `ok` is permanently
+ * `false` by design, and a monitor keyed to it would fire every ten minutes
+ * forever and be muted within a day; on this deployment an admin identity IS set,
+ * so `ok` reads `true` and would mask a real fault the moment that changed.
+ * Either way it is the wrong signal. Liveness here is instead: HTTP 200, a
+ * parseable body, and `role == "publisher"` (which also proves we reached our own
+ * app and not a captive portal or a holding page).
  */
 
 // The one warning that is expected on this deployment. Matched by prefix so the
@@ -36,9 +40,9 @@ const EXPECTED_WARNING = "No publishing admin identity configured";
 // products and this is what tags which one an alert came from.
 const TELEGRAM_PREFIX = "OPENSHORTS ✂️ - ";
 
-const DEFAULT_TIMEOUT_MS = 25000;
+const DEFAULT_TIMEOUT_MS = 60000;
 
-// A Space that is waking or rebuilding answers 503 for a minute or two, and the
+// A host that is waking or rebuilding answers 503 for a minute or two, and the
 // probe itself is often what woke it. Alerting on one bad tick would cry wolf
 // after every deploy, so a real alert needs this many consecutive failures.
 // Requires the KV binding to count; see the fallback in `decide`.
@@ -54,7 +58,7 @@ async function probe(env) {
 
   // Cache-busting query rather than a cache header: the request MUST reach the
   // origin, because reaching it is the entire point. A response served from
-  // Cloudflare's cache would let the Space fall asleep while this worker
+  // Cloudflare's cache would let the host fall asleep while this worker
   // cheerfully reported success — the one failure mode that would make the
   // heartbeat worse than useless, since it would also suppress the alert.
   const url = base + (base.includes('?') ? '&' : '?') + 'hb=' + Date.now();
@@ -69,7 +73,7 @@ async function probe(env) {
     });
   } catch (err) {
     const ms = Date.now() - started;
-    // A timeout on a sleeping Space is normal — the wake takes longer than the
+    // A timeout on a sleeping host is normal — the wake takes longer than the
     // probe waits — and is reported as not-live so the retry counter advances.
     const detail = err && err.name === 'TimeoutError'
       ? `no response in ${timeout} ms`
@@ -89,7 +93,7 @@ async function probe(env) {
   } catch {
     // 200 with a non-JSON body is the platform's holding page, not our app.
     return { live: false, degraded: false, kind: 'not_json',
-             detail: 'health returned 200 but not JSON (Space still starting?)', ms };
+             detail: 'health returned 200 but not JSON (host still starting?)', ms };
   }
 
   if (body.role !== 'publisher') {
@@ -166,7 +170,7 @@ function decide(result, previous, scheduledTime, hasState) {
 
   // Degraded-but-live is a config fault, not a transient wake: it alerts on the
   // first sighting, because it will never clear on its own. An unreachable
-  // publisher gets one grace tick, since a waking Space looks identical.
+  // publisher gets one grace tick, since a waking host looks identical.
   const fails = result.live ? prev.fails : prev.fails + 1;
   const shouldAlert = !prev.alerted
     && (result.degraded || fails >= FAILURES_BEFORE_ALERT);

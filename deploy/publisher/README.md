@@ -12,6 +12,12 @@
 > Existing free Docker Spaces are not evidence the gate does not exist — they
 > predate it, and querying the HF API for them is how you talk yourself back into
 > a paywall. A creation form is the only authority on what a creation form allows.
+>
+> **Since 2026-08-21 the host is Render**, at
+> `https://openshorts-publisher.onrender.com`, reporting `role: publisher`,
+> `admin_api_mounted: true` and no warnings. Step 2 stays vendor-neutral anyway —
+> the gate that eliminated two hosts was a pricing decision, and pricing decisions
+> are not permanent.
 
 A schedule needs a clock that is awake at the slot. Nothing in the chain provides
 one: Status 200 accepts `scheduledFor` and discards it (measured across three
@@ -305,9 +311,13 @@ Field labels drift between redesigns; match them by meaning, not by string.
 | Idle | spins down after ~15 min without traffic | scales to zero after **1 h** without traffic |
 | URL | `https://<name>.onrender.com` | `https://<name>-<org>.koyeb.app` |
 
-Koyeb's column was read from their own docs; Render's was not (their docs blocked
-an automated fetch), so treat it as a starting point and confirm on the form —
-including the two disqualifiers in [Appendix C](#appendix-c--choosing-the-host).
+Render is the host this is running on, so its **create flow** is settled: a Docker
+web service off this repo, and no card — the account that built it does not have
+one. Its **tier numbers** above are not settled — Render's docs blocked an
+automated fetch, and a running service does not tell you what the plan permits.
+Koyeb's column was read from their own docs and has not been tried. On either,
+confirm the two disqualifiers in
+[Appendix C](#appendix-c--choosing-the-host) on the form itself.
 One number to check on any host with an hours cap: a month is 730 hours, so an
 always-on service consumes essentially the whole allowance and a second free
 service would not fit beside it.
@@ -424,13 +434,18 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN      # same bot as cloud/alerts.py
 npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler kv namespace create HEARTBEAT_STATE
 # paste the printed id into wrangler.toml and uncomment the kv_namespaces block
-npx wrangler deploy
 ```
 
 Both extras are optional and independent. Without Telegram the Worker still keeps
 the publisher awake, silently. Without KV it still alerts, but at most once an hour
 instead of exactly once per outage. With both: one message when the publisher
 dies, one when it comes back, and nothing in between.
+
+Then deploy — this part is not optional:
+
+```powershell
+npx wrangler deploy
+```
 
 Check it immediately, without waiting for a tick — the Worker's own URL runs the
 probe on demand and deliberately sends no alert:
@@ -442,6 +457,19 @@ curl.exe "https://openshorts-publisher-heartbeat.<your-subdomain>.workers.dev"
 `{"live":true,"degraded":false,"kind":"live",...}` means the pulse works. Live
 cron logs: `npx wrangler tail`.
 
+**What this step is worth, measured.** Run that probe twice in a row against a
+publisher that has been idle. On 2026-08-22, against Render: **22,268 ms** on the
+first call and **83 ms** on the third. The first call is not a slow network, it is
+a container booting — the probe itself is what woke it. That 245× gap is the
+failure this step removes, and it is not hypothetical: it is why the Step 5
+rehearsal on 2026-08-21 was claimed by the laptop instead of the publisher. A
+sleeping publisher does not lose the race, it never enters it.
+
+That number also sets `TIMEOUT_MS`. A 25 s timeout would score a 22–23 s cold
+start as a failed tick, so the default is **60 s** — waiting on the network is not
+CPU time, so a generous timeout costs nothing against the free plan's 10 ms CPU
+cap.
+
 ## Step 4 — Point the laptop at the shared database and the new URL
 
 In the laptop's `.env`:
@@ -450,6 +478,11 @@ In the laptop's `.env`:
 DATABASE_URL=postgresql+asyncpg://postgres.<project-ref>:<encoded-password>@<pooler-host>:5432/postgres
 PUBLISHING_PUBLIC_BASE_URL=https://<publisher-host>
 ```
+
+If you intend to rehearse first — recommended, and the reason Step 5 exists — add
+`PUBLISHING_DRY_RUN=true` here **now**, before the `up -d` below. This is the
+moment the laptop joins a queue another process is already working, and dry-run
+is per-process: the publisher's flag does not cover the laptop's dispatcher.
 
 `DATABASE_URL` is only read from `.env` because `docker-compose.publishing.yml`
 spells the override out as `${DATABASE_URL:-…<local db>…}`. Compose's
@@ -490,7 +523,163 @@ Proof you are on the shared database: the dashboard still lists your existing
 batches and history. An empty Publishing tab means the laptop is still talking to
 its own local Postgres — check the host in `DATABASE_URL`.
 
-## Step 5 — Verify the thing you actually wanted
+## Step 5 — Rehearse it in dry-run
+
+Step 6 posts to real accounts on three platforms. This step runs the same code
+path against the in-repo fake provider first, so a mistake in the wiring between
+the two hosts costs nothing. It is worth doing once, because four things can only
+be tested by a live split deployment, and each of them fails in its own way.
+
+### Set the flag on both hosts, and know why
+
+`providers.get()` reads `settings.dry_run` from the environment of **the process
+that calls it** (`publishing/providers/__init__.py`), and the dispatcher calls it
+once per attempt. Dry-run is therefore a property of a process — never of the
+queue, and never of the row. Both hosts poll one queue, and `FOR UPDATE SKIP
+LOCKED` means whichever claims an attempt first is the one that decides how it
+gets published. `PUBLISHING_DRY_RUN=1` on the publisher does **not** stop the
+laptop submitting the same post for real.
+
+So set it in the laptop's `.env` too, before Step 4's `up -d`:
+
+```
+PUBLISHING_DRY_RUN=true
+```
+
+and confirm the publisher agrees — `"dry_run": true` in its
+`/api/publishing/health`, which is the same payload you read in Step 2.
+
+> **Never point a dry-run process at a queue that holds real pending work.** A
+> fake submit is recorded as a *success*: the row goes `succeeded` with a
+> `fakepost_…` ref, and `succeeded` is one of the four states covered by the
+> partial unique index on `(publish_request_id, publish_destination_id)`. The
+> duplicate guard then refuses a real attempt for that pair — the post is
+> unrecoverable through the UI while the board says it published.
+>
+> The publisher starts claiming the moment it boots, so on an already-running
+> host this check is retrospective as well as preventative:
+>
+> ```powershell
+> $h = @{ Authorization = "Bearer $env:PUBLISHING_ADMIN_TOKEN" }
+> $b = "https://<publisher-host>/api/publishing/admin"
+> irm "$b/attempts?status=pending"  -Headers $h | % attempts | ft platform,status
+> irm "$b/attempts?status=deferred" -Headers $h | % attempts | ft platform,status
+> irm "$b/attempts?status=succeeded" -Headers $h | % attempts |
+>   ? provider_post_ref -like 'fakepost_*' | ft platform,provider_post_ref
+> ```
+>
+> The first two list what a rehearsal would consume. The third lists what one
+> already consumed.
+
+### The four checks
+
+| # | Question only a split deployment can answer | Pass |
+|---|---|---|
+| 1 | Does the publisher see, claim and dispatch the laptop's queue? | its dry-run log holds the submission |
+| 2 | Do the two hosts share one master key? | no `credential_unreadable` |
+| 3 | Can it resolve media whose bytes it has never held? | a presigned bucket URL it signed itself |
+| 4 | Is the callback URL reachable from outside? | `401 invalid signature` |
+
+**Check 1 — the shared queue, and who did the work.**
+
+1. Clear the publisher's dry-run log, so anything you see afterwards is from this
+   test: `irm -Method Post "$b/dry-run/reset" -Headers $h`.
+2. From the laptop's dashboard, publish one clip to one destination, with a slot
+   about three minutes out and a caption you will recognise.
+3. Wait for `✅ Publishing: staged … KB/s` in the laptop's log.
+4. **Stop the laptop's backend**:
+   `docker compose -f docker-compose.yml -f docker-compose.publishing.yml stop backend`.
+   This is not only realism. The laptop's dispatcher polls every five seconds and
+   would usually win the claim, and a test the laptop can win proves nothing about
+   the publisher.
+5. At the slot: `irm "$b/dry-run" -Headers $h`.
+
+Pass: `submissions` holds one entry carrying your caption, the destination's
+account ref and a `fakefile_…` media ref. That list is a module-level global in
+the publisher's own memory (`publishing/providers/fake.py`) — an entry in it
+cannot have come from the laptop, which is what makes this attribution and not a
+guess. Cross-check the row itself with
+`irm "$b/attempts?status=succeeded" -Headers $h`: `provider_post_ref` starts with
+`fakepost_`, and the durable record of which process did it is `claimed_by` on the
+attempt (`hostname:pid:…`, set at claim time and never cleared by a success).
+
+Fail, and what each one means:
+
+| symptom | meaning |
+|---|---|
+| `submissions: []`, attempt still `pending` | the publisher is not dispatching — check its log, and that `DATABASE_URL` names the same pooler host as the laptop's |
+| `409 PUBLISHING_DRY_RUN is not enabled` | the publisher is **live**. Stop it before anything else |
+| attempt `deferred`, `error_code: no_credential` | no key on *this* database — either a different database than you think, or the credential was never entered here |
+| attempt `deferred`, `error_code: credential_unreadable` | check 2 |
+
+**Check 2 — one master key across two hosts.** Nothing extra to run; check 1
+covers it. In dry-run the fake ignores the *value* of the key and only requires it
+to be non-empty, so an auth-shaped failure here cannot be a bad provider key — it
+can only be the wrapping. `credential_unreadable` means the publisher's
+`PUBLISHING_MASTER_KEY` cannot open a blob the laptop sealed; AES-256-GCM
+authenticates, so a wrong key fails to decrypt rather than returning garbage. In
+production this is the failure that looks exactly like a revoked provider key.
+Dry-run is the only place it is unambiguous. It consumes no try, so the attempt
+parks and re-runs once the key is fixed rather than dying.
+
+**Check 3 — media the publisher has no bytes for.** In the same `/dry-run`
+response, read `uploads[0].url`. The publisher presigns the staged object itself
+(`dispatcher.ensure_media_ref`) and hands the URL to the provider; the fake
+records it verbatim.
+
+Pass: a URL on your bucket host with a signature query string. That is the whole
+reason a submit needs no local file, and therefore the reason the laptop can be
+shut. A failure here is usually *not* the publisher: an attempt parked for want of
+media means the clip never reached the bucket, which is the laptop's transfer
+loop. Confirm the `staged` line in item 2 before the laptop goes down.
+
+**Check 4 — the callback lands.** With the laptop still off:
+
+```powershell
+irm -Method Post -Body '{}' -ContentType application/json `
+    "https://<publisher-host>/api/publishing/webhook/status200"
+```
+
+Pass: **`401 {"error":"invalid signature"}`**. One response proves more than it
+looks — DNS resolves, TLS terminates, the route is mounted, and, because
+`_verify_against_groups` queries the batches for that provider *before* the
+signature check can decide anything, the host reached **Postgres** to go looking
+for a secret. For a publisher whose entire job depends on a database it does not
+host, that last one is the real prize.
+
+What the 401 does **not** prove is that `status200` is a registered provider.
+`providers.get` is not reached until after the signature check has already
+returned ([`publishing/webhooks.py:74`](../../publishing/webhooks.py#L74) versus
+[`:108`](../../publishing/webhooks.py#L108)), so an unsigned POST to
+`/webhook/anything-at-all` returns exactly the same 401. **There is no reachable
+`404` on this path without a valid signature**, so do not treat one as a
+diagnostic for a wrong provider segment — you will never see it. A connection
+error or a `502` means the host is not serving.
+
+That is reachability, which is what the split deployment adds. To exercise the
+full drain — signature verified, event stored, row advanced — put `slow` in the
+caption when you create the request: the fake then answers `submitted` and waits
+for a webhook, exactly as Status 200 does. Signing a `post.published` body needs
+the group's webhook secret in plaintext, and the admin API returns only its
+fingerprint, so this is possible only if you kept it when you set it. Do not
+rotate it for a test — the real provider is configured with the current one.
+`tests/test_publishing_e2e.py` covers the same path against a throwaway Postgres.
+
+### Putting it back
+
+Set `PUBLISHING_DRY_RUN=false` on both hosts and apply it with `up -d` on the
+laptop and a redeploy on the publisher. Nothing needs cleaning up on the
+publisher: `submissions` lives in process memory and the redeploy takes it with
+it. (Reset it *before* you flip if you want it empty either way — the endpoint
+409s once dry-run is off.)
+
+The rehearsal's rows stay in history with their `fakepost_` refs. They block
+nothing: the duplicate guard is scoped to one request-and-destination pair, and
+your next real post is a different request. That is why the recognisable caption
+in item 2 is worth the two seconds — it is how you will know, months later, that
+the row was a rehearsal.
+
+## Step 6 — Verify the thing you actually wanted
 
 1. Plan a batch with slots 30–60 minutes out.
 2. Watch the laptop until each clip logs `✅ Publishing: staged … KB/s`.
@@ -499,7 +688,7 @@ its own local Postgres — check the host in `DATABASE_URL`.
    dashboard (once the laptop is back) shows the attempts as submitted/succeeded
    with their provider refs.
 
-Step 3 is the test. Everything else in this document exists to make it pass.
+Item 3 is the test. Everything else in this document exists to make it pass.
 
 ---
 
