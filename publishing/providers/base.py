@@ -27,6 +27,24 @@ class Capabilities:
     name: str
     platforms: tuple = ()
 
+    # --- Operator-facing identity ---------------------------------------------
+    # The admin UI renders these instead of hardcoding a provider name. It had
+    # six such strings ("status 200 api key", "rl_…", "Paste the secret Status
+    # 200 generated…") and every one of them lied the moment a second provider
+    # existed — a Zernio batch told the operator to paste a Status 200 key.
+    # `label` is the display name; empty means "use `name`".
+    label: str = ""
+    # Leading characters of this provider's API keys, used as the input's
+    # placeholder. Not validated against — a provider may change its prefix and
+    # a wrong placeholder must not refuse a working key.
+    key_prefix: str = ""
+    # True for an adapter that publishes nowhere — the dry-run fake. Declared
+    # rather than name-checked so the admin UI can leave it out of the "which
+    # provider?" picker without the frontend knowing which adapter is the fake.
+    # Creating a group on a simulated provider would look normal and silently
+    # publish nothing.
+    simulated: bool = False
+
     # Media is uploaded once and the returned ref is reusable across posts and
     # platforms. False means upload per submission.
     supports_media_refs: bool = False
@@ -49,8 +67,20 @@ class Capabilities:
     supports_account_listing: bool = False
     # Signed inbound callbacks.
     supports_webhooks: bool = False
+    # HTTP header the provider signs its callbacks with. Declared because every
+    # provider picks its own name and the receiver must not hardcode one — Status
+    # 200 sends X-Webhook-Signature, Zernio sends X-Zernio-Signature, and reading
+    # the wrong header rejects every callback as unsigned.
+    signature_header: str = "X-Webhook-Signature"
     # One request carries one platform (vs. a multi-platform fan-out per call).
     one_platform_per_request: bool = True
+    # Several independent provider accounts may live in ONE publishing group,
+    # addressed by credential_slot. True only where the provider's own account
+    # model forces it: Zernio's free tier connects 2 social accounts per Zernio
+    # account, so 3 destinations need 2 keys in one logical batch. Providers that
+    # leave this False reject a credential slot at the API instead of storing a
+    # key nothing would ever resolve.
+    multi_credential: bool = False
 
 
 @dataclass
@@ -166,3 +196,25 @@ class Provider(Protocol):
         Must NOT create a real post.
         """
         ...
+
+
+# --- Optional adapter hooks -------------------------------------------------
+# Not part of the Protocol, because every one of them has a correct default and a
+# provider that does not need it should not have to write a stub. The caller
+# reaches them with getattr(provider, name, None), so an adapter opts in.
+#
+#   verify_signature(secret, raw_body, presented) -> bool
+#       Override webhook signature verification. Default:
+#       ``signing.verify_webhook_signature`` (hex, ``sha256=`` prefix optional).
+#       Override when the provider's encoding differs or is undocumented.
+#   remote_schedule_ok() -> bool
+#   disable_remote_schedule(reason) -> None
+#       Process-lifetime health of the remote-schedule field, so one
+#       accepted-and-ignored timestamp stops the hand-over instead of a day's
+#       worth of posts firing at once.
+#   check_credential(api_key) -> {"ok", "code", "detail"}
+#       Non-destructive "is this key accepted at all". Must not create a post.
+#   list_accounts(api_key) -> list[dict]
+#       Only where ``supports_account_listing`` is True.
+#   cancel(api_key, provider_post_ref) -> bool
+#       Only where ``supports_cancel_scheduled`` is True.

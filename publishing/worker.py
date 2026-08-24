@@ -189,9 +189,23 @@ async def _reconcile_loop() -> None:
 async def reconcile_once() -> dict:
     """One reconciliation pass. Returns what it did, for tests and metrics."""
     out = {"webhooks": 0, "stale": 0, "media_expired": 0, "assignments": 0,
-           "slots": 0, "media_preregistered": 0, "promoted": 0}
+           "slots": 0, "media_preregistered": 0, "promoted": 0, "polled": 0}
 
     out["webhooks"] = await webhooks.drain_pending()
+
+    # Before the sweeper, and in its own transaction. Order first: a post the
+    # provider can be ASKED about must be asked before `sweep_stale_submitted`
+    # condemns it to `unknown` — reversing these two would let the timeout win a
+    # race it does not need to be in, and `unknown` is terminal and needs a human.
+    # Separate transaction second: this is provider I/O, one status lookup per
+    # post, and holding the sweeps' transaction open across it would block them on
+    # a slow provider. A no-op for a provider without `supports_status_lookup`.
+    try:
+        async with db.session() as session:
+            async with session.begin():
+                out["polled"] = await dispatcher.poll_submitted_attempts(session)
+    except Exception as e:
+        print(f"⚠️  Publishing status poll error: {e}")
 
     async with db.session() as session:
         async with session.begin():
@@ -403,11 +417,19 @@ async def _sweep_store_if_due() -> int:
     Age alone is not the test, and this is where it would be easy to break
     publishing subtly. Two things pin an object:
 
-      * a queued attempt — a post scheduled a week out keeps its clip staged no
-        matter how old the object is;
+      * a queued or in-flight attempt — a post scheduled a week out keeps its clip
+        staged no matter how old the object is, and so does one already handed to
+        the provider but not yet confirmed;
       * a cached provider media ref — the provider stored our presigned URL at
         registration and re-reads it at post time, so deleting the object under a
         live ref turns a healthy post into "could not download the file".
+
+    The first of those two is what covers a REF-LESS provider, which creates no
+    ``publish_media`` rows at all and therefore has nothing in the second. Such a
+    provider is handed a presigned URL inside the submit and fetches from it on its
+    own schedule, so the SUBMITTED pin is the only thing standing between a
+    scheduled post and a deleted clip. It is in the list below; this paragraph is
+    here so a future tidy-up does not remove it as redundant.
 
     What is left is the tail: objects whose posts already went out and whose refs
     have expired.

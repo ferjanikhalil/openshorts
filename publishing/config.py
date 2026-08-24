@@ -29,6 +29,27 @@ BACKOFF_CAP_SECONDS = 3600
 # may already be live double-publishes to a real audience.
 SUBMIT_TIMEOUT_SECONDS = 1800
 
+# Status polling, for the providers that support it at all.
+#
+# `supports_status_lookup` is False for Status 200 (no such endpoint), so for
+# years the ONLY completion signal was a webhook and the timeout above was the
+# only backstop. A provider that can be asked "is this post live?" turns that
+# backstop into a last resort instead of the normal ending for any post whose
+# callback was lost.
+#
+# The floor exists because polling immediately is both useless and rude: the
+# provider has just accepted the post and is still working on it, and a poll at
+# t+2s spends a request to be told what the submit response already said. It also
+# has to stay well under SUBMIT_TIMEOUT_SECONDS, or a post would be condemned to
+# `unknown` before it was ever asked about.
+STATUS_POLL_MIN_AGE_SECONDS = 120
+# Re-ask no more often than this. Reconciliation runs every 60s by default, and a
+# post that stays pending for an hour must not cost 60 requests.
+STATUS_POLL_INTERVAL_SECONDS = 300
+# Ceiling per pass. Polling is serial provider I/O inside one transaction, so an
+# unbounded batch would hold a transaction open for minutes.
+STATUS_POLL_BATCH = 20
+
 # How old a claim must be before boot recovery treats it as abandoned.
 #
 # `in_flight` means "claimed, not yet handed to the provider", and recovery
@@ -188,6 +209,35 @@ class Settings:
     def submit_timeout_seconds(self) -> int:
         return int(os.environ.get("PUBLISHING_SUBMIT_TIMEOUT",
                                  str(SUBMIT_TIMEOUT_SECONDS)))
+
+    @property
+    def status_poll_min_age_seconds(self) -> int:
+        """How long a submitted post is left alone before it is polled."""
+        return int(os.environ.get("PUBLISHING_STATUS_POLL_MIN_AGE",
+                                  str(STATUS_POLL_MIN_AGE_SECONDS)))
+
+    @property
+    def status_poll_interval_seconds(self) -> int:
+        """Minimum gap between two polls of the same post."""
+        return int(os.environ.get("PUBLISHING_STATUS_POLL_INTERVAL",
+                                  str(STATUS_POLL_INTERVAL_SECONDS)))
+
+    @property
+    def status_poll_batch(self) -> int:
+        return int(os.environ.get("PUBLISHING_STATUS_POLL_BATCH",
+                                  str(STATUS_POLL_BATCH)))
+
+    @property
+    def status_poll_enabled(self) -> bool:
+        """Off switch for the poller, independent of the provider's capability.
+
+        The kill switch for the case where polling itself is the problem — a
+        provider rate-limiting the status endpoint, or answering it wrongly.
+        Webhooks and the stale sweeper still resolve posts without it.
+        """
+        return os.environ.get(
+            "PUBLISHING_STATUS_POLL", "true").strip().lower() not in (
+                "0", "false", "no", "off")
 
     @property
     def orphan_claim_min_age_seconds(self) -> int:

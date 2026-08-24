@@ -124,8 +124,12 @@ async def expand_destinations(session, *, destination_ids: Iterable = (),
     return out
 
 
+_UNSET = object()
+
+
 async def active_credential(session, group_id, kind: str = "api_key",
-                            include_invalid: bool = False):
+                            include_invalid: bool = False,
+                            slot=_UNSET):
     """Newest usable credential of a kind for a group.
 
     Rotation is by-insert, so "newest active" is the current one; a credential
@@ -137,6 +141,13 @@ async def active_credential(session, group_id, kind: str = "api_key",
     was rejected, here is why" instead of "no key stored") and the verify
     endpoint (whose whole job is to clear the flag once the key works again).
     Dispatch must never pass it — that is what the exclusion is for.
+
+    ``slot`` selects ONE provider account inside the group. Omitted means "any
+    slot", which is the historical behaviour and what group-wide callers want;
+    ``slot=None`` means specifically the default (unslotted) credential, which is
+    not the same question. Keeping those distinct is what stops a group-wide
+    lookup from silently answering with a slotted key it has no business using —
+    and vice versa. Use ``credential_for_destination`` for dispatch.
     """
     stmt = (
         select(PublishCredential)
@@ -147,9 +158,79 @@ async def active_credential(session, group_id, kind: str = "api_key",
         .order_by(PublishCredential.created_at.desc())
         .limit(1)
     )
+    if slot is not _UNSET:
+        stmt = (stmt.where(PublishCredential.credential_slot.is_(None))
+                if slot in (None, "") else
+                stmt.where(PublishCredential.credential_slot == slot))
     if not include_invalid:
         stmt = stmt.where(PublishCredential.invalid_at.is_(None))
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def active_credentials(session, group_id, kind: str = "api_key",
+                             include_invalid: bool = False) -> list:
+    """Every current credential of a kind for a group — one per slot.
+
+    "Current" is still newest-active-per-slot, because rotation is by-insert and
+    a superseded row stays behind for the audit trail. The admin view needs the
+    whole set: a group holding two provider accounts has two keys that can fail
+    independently, and showing only one of them hides the exact key a destination
+    is stuck on.
+
+    Not for dispatch. Dispatch resolves ONE key through the destination — see
+    ``credential_for_destination``.
+    """
+    stmt = (
+        select(PublishCredential)
+        .where(PublishCredential.publish_group_id == _as_uuid(group_id),
+               PublishCredential.kind == kind,
+               PublishCredential.active.is_(True),
+               PublishCredential.revoked_at.is_(None))
+        .order_by(PublishCredential.created_at.desc())
+    )
+    if not include_invalid:
+        stmt = stmt.where(PublishCredential.invalid_at.is_(None))
+    rows = (await session.execute(stmt)).scalars().all()
+
+    newest_per_slot, out = set(), []
+    for row in rows:  # already newest-first
+        slot = row.credential_slot or ""
+        if slot in newest_per_slot:
+            continue
+        newest_per_slot.add(slot)
+        out.append(row)
+    # Default first, then slots alphabetically: a stable order the UI can render
+    # without sorting, and one where the group's primary key stays on top.
+    out.sort(key=lambda c: (c.credential_slot is not None,
+                            c.credential_slot or ""))
+    return out
+
+
+async def credential_for_destination(session, destination, kind: str = "api_key",
+                                     include_invalid: bool = False):
+    """The credential a specific destination publishes through.
+
+    Resolution is slot-then-default: a destination naming a slot uses that slot's
+    key, and anything unslotted uses the group default. The fallback is
+    deliberately one-directional — a slotted destination does NOT fall back to
+    the default key.
+
+    That looks unhelpful until you consider what the fallback would do on the
+    shape this exists for. A Zernio group holds two accounts because neither can
+    connect all three platforms; account A has TikTok and YouTube, account B has
+    Instagram. Falling back would submit the Instagram post with account A's key,
+    where the provider answers that no such account is connected — after the
+    submit, having spent an attempt, and with an error that reads like a
+    disconnected social account rather than a mapping mistake. Returning nothing
+    parks the attempt with "no credential for slot 'zernio-b'", which says
+    exactly what the operator has to fix.
+    """
+    slot = (getattr(destination, "credential_slot", None) or "").strip()
+    if slot:
+        return await active_credential(session, destination.publish_group_id,
+                                       kind, include_invalid, slot=slot)
+    return await active_credential(session, destination.publish_group_id,
+                                   kind, include_invalid, slot=None)
 
 
 # --- Request creation -------------------------------------------------------
@@ -478,17 +559,28 @@ async def _mark_destination_unhealthy(session, attempt, err) -> None:
 
 
 async def _mark_credential_invalid(session, attempt, err, credential_id) -> None:
-    """A 401 means every queued post for this group will also fail.
+    """A 401 means every queued post using THAT key will also fail.
 
     Marking the credential stops the other 26 posts of the day from each
     rediscovering the same dead key, and gives the admin UI something concrete
     to show.
+
+    Which key gets marked is the whole risk here. ``credential_id`` is the one
+    dispatch actually signed with and is always passed on the live path; the
+    fallback exists for callers that only have the attempt. That fallback must
+    resolve through the DESTINATION, not the group: a group can now hold several
+    provider accounts, and a group-wide lookup would answer with whichever key
+    was newest — so one dead Zernio account would disable the healthy one and
+    take out every platform instead of the one that actually broke.
     """
     cred = None
     if credential_id:
         cred = await session.get(PublishCredential, credential_id)
     if cred is None:
-        cred = await active_credential(session, attempt.publish_group_id)
+        dest = await session.get(PublishDestination,
+                                 attempt.publish_destination_id)
+        if dest is not None:
+            cred = await credential_for_destination(session, dest)
     if cred is None:
         return
     cred.invalid_at = _now()
@@ -497,6 +589,7 @@ async def _mark_credential_invalid(session, attempt, err, credential_id) -> None
                     group_id=attempt.publish_group_id,
                     request_id=attempt.publish_request_id,
                     data={"credential_id": str(cred.id),
+                          "slot": cred.credential_slot,
                           "last4": cred.last4})
 
 

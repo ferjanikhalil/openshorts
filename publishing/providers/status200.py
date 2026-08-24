@@ -115,6 +115,8 @@ READ_TIMEOUT = 120.0
 
 CAPABILITIES = Capabilities(
     name="status200",
+    label="Status 200",
+    key_prefix="rl_",
     platforms=(plat.YOUTUBE, plat.INSTAGRAM, plat.TIKTOK),
     supports_media_refs=True,
     media_by_url=True,

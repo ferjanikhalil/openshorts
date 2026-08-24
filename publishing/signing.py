@@ -46,6 +46,45 @@ def verify_webhook_signature(secret: str, raw_body: bytes,
     return any(hmac.compare_digest(expected, c) for c in candidates)
 
 
+def verify_webhook_signature_any_encoding(
+        secret: str, raw_body: bytes, presented: Optional[str]) -> bool:
+    """Same check, but accepting the digest in hex OR base64.
+
+    For providers that document "HMAC-SHA256 of the raw body" and never say how
+    it is encoded — Zernio is one. Guessing wrong is not a soft failure: every
+    callback is rejected as unsigned, no post is ever confirmed, and each one ages
+    into ``unknown`` for a human to resolve by hand.
+
+    Accepting both encodings is not a weakening. Both candidates are derived from
+    the same secret over the same preimage, so an attacker who can produce either
+    can already produce the digest itself; only the transport spelling differs.
+    Comparison is over a fixed candidate set with ``compare_digest``, so it stays
+    constant-time per candidate.
+
+    Kept out of ``verify_webhook_signature`` on purpose: Status 200's verification
+    path is proven in production and does not change to accommodate a second
+    provider. An adapter opts in.
+    """
+    if not secret or not presented:
+        return False
+    presented = presented.strip()
+    if presented.lower().startswith(_SIG_PREFIX):
+        presented = presented[len(_SIG_PREFIX):].strip()
+    digest = hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()
+    candidates = [
+        digest.hex(),
+        base64.b64encode(digest).decode(),
+        base64.urlsafe_b64encode(digest).decode().rstrip("="),
+    ]
+    # Compare every candidate — no early exit — so the work is the same whichever
+    # encoding the provider chose.
+    matched = False
+    for c in candidates:
+        if hmac.compare_digest(c, presented):
+            matched = True
+    return matched
+
+
 def within_skew(created_at_epoch: Optional[float], max_skew_seconds: int,
                 now: Optional[float] = None) -> bool:
     """Bound how old a webhook may be.

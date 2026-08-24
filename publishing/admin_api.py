@@ -32,6 +32,7 @@ from . import (
 )
 from .admin_auth import AdminIdentity, require_publishing_admin
 from .config import settings
+from .errors import ProviderError
 from .models import (
     PublishAssignment, PublishAttempt, PublishCredential, PublishDestination,
     PublishEvent, PublishGroup,
@@ -59,14 +60,41 @@ def _uuid_or_404(value, label: str):
         raise HTTPException(404, f"{label} not found")
 
 
-def _credential_aad(group_id, kind: str, provider: str) -> str:
-    """Bind a ciphertext to its group, kind and provider.
+def _credential_aad(group_id, kind: str, provider: str, slot=None) -> str:
+    """Bind a ciphertext to its group, kind, provider and slot.
 
     GCM verifies the AAD on decrypt, so a webhook secret blob copied into an
     api_key row — or a credential moved between groups in the database — fails to
-    decrypt instead of silently authenticating as something it is not.
+    decrypt instead of silently authenticating as something it is not. Including
+    the slot extends that to the multi-account case: account A's key cannot be
+    swapped into account B's row.
+
+    The ``slot`` segment is appended ONLY for a named slot, and that condition is
+    load-bearing rather than cosmetic. Every credential stored before slots
+    existed was sealed against exactly ``group:…|kind:…|provider:…``; appending
+    ``|slot:None`` unconditionally would change the AAD of every one of them,
+    GCM would refuse to open them, and each would surface at dispatch as
+    ``credential_unreadable`` — indistinguishable from a rotated master key, for
+    keys that are perfectly fine and cannot be recovered without re-entry. A
+    NULL slot is the group default, so it keeps the legacy string byte for byte.
     """
-    return f"group:{group_id}|kind:{kind}|provider:{provider}"
+    base = f"group:{group_id}|kind:{kind}|provider:{provider}"
+    slot = (slot or "").strip()
+    return f"{base}|slot:{slot}" if slot else base
+
+
+def _multi_credential(provider_name: str) -> bool:
+    """Does this provider's adapter support several accounts in one batch?
+
+    Declared by the adapter (``Capabilities.multi_credential``) rather than
+    inferred, so the admin API can refuse a credential slot that nothing would
+    ever resolve instead of storing an unreachable key.
+    """
+    try:
+        caps = providers.get(provider_name).capabilities
+    except KeyError:
+        return False
+    return bool(getattr(caps, "multi_credential", False))
 
 
 async def _get_group(session, group_id) -> PublishGroup:
@@ -94,11 +122,21 @@ async def _group_payload(session, group: PublishGroup) -> dict:
     # one is added" for a key that was sitting right there, invalidated — so the
     # operator had no way to see the real problem or the provider's reason.
     # views.credential_out already carries `invalid` / `invalid_reason`.
-    cred = await service.active_credential(session, group.id,
-                                          include_invalid=True)
+    #
+    # All active api_key rows, not just one: a group may hold several provider
+    # accounts (see PublishCredential.credential_slot), and showing only the
+    # newest would hide the very key a destination is failing on. `credential`
+    # stays in the payload as the default (unslotted) key so the existing
+    # single-key UI keeps working unchanged.
+    creds = await service.active_credentials(session, group.id,
+                                             include_invalid=True)
+    default = next((c for c in creds if not c.credential_slot), None)
     hook = await service.active_credential(session, group.id,
                                            kind="webhook_secret",
                                            include_invalid=True)
+    hooks = await service.active_credentials(session, group.id,
+                                             kind="webhook_secret",
+                                             include_invalid=True)
     dests = (await session.execute(
         select(PublishDestination)
         .where(PublishDestination.publish_group_id == group.id)
@@ -106,8 +144,10 @@ async def _group_payload(session, group: PublishGroup) -> dict:
                   PublishDestination.display_name))).scalars().all()
     return views.group_out(
         group,
-        credential=views.credential_out(cred) if cred else None,
+        credential=views.credential_out(default) if default else None,
+        credentials=[views.credential_out(c) for c in creds],
         webhook_secret=views.credential_out(hook) if hook else None,
+        webhook_secrets=[views.credential_out(h) for h in hooks],
         webhook_url=_webhook_url(group.provider),
         destinations=[views.destination_out(d) for d in dests],
         summary=await service.group_summary(session, group.id))
@@ -255,7 +295,7 @@ async def set_credential(group_id: str, body: CredentialCreate,
                          verify: bool = Query(True),
                          ident: AdminIdentity = Depends(require_publishing_admin),
                          session=Depends(db.get_db)):
-    """Store (or rotate) this group's provider secret.
+    """Store (or rotate) one of this group's provider secrets.
 
     The ONLY endpoint in the application that accepts a provider key. The
     plaintext lives in this function's frame and inside ``crypto.encrypt``; it is
@@ -264,9 +304,25 @@ async def set_credential(group_id: str, body: CredentialCreate,
     ``verify=true`` (the default) probes the provider first with a
     non-destructive call, so a typo is caught while the operator is still looking
     at the form instead of at 3 a.m. when 27 posts fail. The probe creates no post.
+
+    ``body.credential_slot`` names WHICH provider account this key is for. Omit it
+    for a single-account group and it stores the group default, exactly as before.
+    Give it a label and the key is stored beside the others, not on top of them —
+    which is what the revoke sweep below is scoped to.
     """
     group = await _get_group(session, group_id)
+    slot = (body.credential_slot or "").strip() or None
     api_key = body.api_key  # plaintext, this frame only
+
+    if slot and not _multi_credential(group.provider):
+        # Refuse rather than store an unreachable key. Nothing resolves a slot for
+        # a provider whose adapter does not declare multi-account support, so the
+        # row would sit there looking configured while every destination fell
+        # through to the default — a silent misconfiguration instead of a message.
+        raise HTTPException(
+            400, f"the {group.provider} adapter does not support several "
+                 f"provider accounts in one batch, so a credential slot has "
+                 f"nothing to resolve. Store this key without a slot.")
 
     if body.kind == "api_key" and verify:
         provider = providers.get(group.provider)
@@ -281,16 +337,24 @@ async def set_credential(group_id: str, body: CredentialCreate,
                     400, f"the provider rejected this key: "
                          f"{result.get('detail', 'unknown reason')}")
 
-    aad = _credential_aad(group.id, body.kind, group.provider)
+    aad = _credential_aad(group.id, body.kind, group.provider, slot)
     sealed = crypto.encrypt(api_key, aad=aad)
     del api_key  # nothing below this line may touch the plaintext
 
     # Rotation is by-insert: the previous row is revoked, not overwritten, so a
     # historical attempt can still name the credential that signed it.
+    #
+    # Scoped to THIS slot, which is the whole point. Un-scoped, adding the second
+    # Zernio account's key would revoke the first one on the way in — and the
+    # operator would watch a batch that published to three platforms a minute ago
+    # start parking every post on "no API key" for a reason the UI attributes to
+    # the key they just added.
     prior = (await session.execute(
         select(PublishCredential).where(
             PublishCredential.publish_group_id == group.id,
             PublishCredential.kind == body.kind,
+            PublishCredential.credential_slot.is_(None) if slot is None
+            else PublishCredential.credential_slot == slot,
             PublishCredential.active.is_(True),
             PublishCredential.revoked_at.is_(None)))).scalars().all()
     for row in prior:
@@ -299,6 +363,7 @@ async def set_credential(group_id: str, body: CredentialCreate,
 
     cred = PublishCredential(
         publish_group_id=group.id, provider=group.provider, kind=body.kind,
+        credential_slot=slot,
         key_version=sealed["key_version"], nonce_b64=sealed["nonce_b64"],
         ciphertext_b64=sealed["ciphertext_b64"], aad=sealed["aad"],
         fingerprint=sealed["fingerprint"], last4=sealed["last4"], active=True)
@@ -308,9 +373,11 @@ async def set_credential(group_id: str, body: CredentialCreate,
     await service.log_event(
         session, "credential.set",
         # The audit line records the fingerprint, never the key.
-        message=f"{body.kind} rotated (fingerprint {sealed['fingerprint'][:8]})",
+        message=(f"{body.kind} rotated"
+                 + (f" for account “{slot}”" if slot else "")
+                 + f" (fingerprint {sealed['fingerprint'][:8]})"),
         group_id=group.id, actor=ident.label,
-        data={"kind": body.kind, "last4": sealed["last4"],
+        data={"kind": body.kind, "slot": slot, "last4": sealed["last4"],
               "replaced": len(prior)})
     await session.commit()
     return {"credential": views.credential_out(cred),
@@ -330,22 +397,30 @@ async def list_credentials(group_id: str, session=Depends(db.get_db)):
 
 
 @router.post("/groups/{group_id}/credential/verify")
-async def verify_credential(group_id: str, session=Depends(db.get_db)):
-    """Re-probe the stored key without changing it.
+async def verify_credential(group_id: str,
+                            slot: Optional[str] = Query(None),
+                            session=Depends(db.get_db)):
+    """Re-probe a stored key without changing it.
 
     Answers "is this key still good?" — after a provider-side revocation, or to
     clear the ``invalid`` flag once the operator has fixed things upstream. Uses
     the same non-destructive probe as ``set_credential``; no post is created.
+
+    ``slot`` picks which provider account to probe. Omitted means the group
+    default, so a single-key group behaves exactly as before.
     """
     group = await _get_group(session, group_id)
     # include_invalid: clearing the invalid flag is half of what this endpoint is
     # for, and an invalidated row is exactly the one it has to load. Without it
     # the 404 below fired for every rejected key and the recovery path underneath
     # was unreachable — the only way back was to re-paste the key.
-    cred = await service.active_credential(session, group.id,
-                                          include_invalid=True)
+    cred = await service.active_credential(
+        session, group.id, include_invalid=True,
+        slot=(slot or "").strip() or None)
     if cred is None:
-        raise HTTPException(404, "this group has no active API key")
+        raise HTTPException(
+            404, f"there is no active API key for account “{slot}” in this batch"
+            if slot else "this group has no active API key")
 
     try:
         secret = crypto.decrypt({
@@ -370,29 +445,118 @@ async def verify_credential(group_id: str, session=Depends(db.get_db)):
             "credential": views.credential_out(cred)}
 
 
+@router.get("/groups/{group_id}/accounts")
+async def list_provider_accounts(group_id: str,
+                                 slot: Optional[str] = Query(None),
+                                 session=Depends(db.get_db)):
+    """The social accounts a stored key can actually reach. Publishes nothing.
+
+    Optional per provider, like ``check_credential``: an adapter that exposes
+    ``list_accounts`` gets asked, and the rest answer ``accounts: null`` so the
+    UI can offer typing the id by hand instead of showing an error for a
+    capability that was never claimed.
+
+    This is what makes the multi-account batch workable. With two keys in one
+    group, "which Zernio account holds Instagram?" is otherwise answered by a 403
+    on the first real post — a public, quota-spending way to learn a mapping.
+    ``slot`` picks which key to ask; omitted means the group default.
+
+    Returns no secret: each entry is the provider's own account id, platform and
+    handle, all of which the operator already sees in the provider's dashboard.
+    """
+    group = await _get_group(session, group_id)
+    slot = (slot or "").strip() or None
+    cred = await service.active_credential(
+        session, group.id, include_invalid=True, slot=slot)
+    if cred is None:
+        raise HTTPException(
+            404, f"there is no active API key for account “{slot}” in this batch"
+            if slot else "this group has no active API key")
+
+    provider = providers.get(group.provider)
+    lister = getattr(provider, "list_accounts", None)
+    if lister is None:
+        return {"provider": group.provider, "slot": slot, "accounts": None,
+                "detail": "this provider cannot list connected accounts — "
+                          "enter the account id by hand."}
+
+    try:
+        secret = crypto.decrypt({
+            "key_version": cred.key_version, "nonce_b64": cred.nonce_b64,
+            "ciphertext_b64": cred.ciphertext_b64, "aad": cred.aad})
+    except Exception as e:
+        raise HTTPException(500, crypto.scrub(str(e))[:300])
+
+    try:
+        accounts = await lister(secret.reveal())
+    except ProviderError as e:
+        # 502, not 500: the provider refused, the request was fine. scrub()
+        # because a provider error body is a place a key has leaked before.
+        raise HTTPException(502, crypto.scrub(
+            f"{e.code}: {e.message}")[:300])
+
+    # Which of these are already registered, so the UI can offer only the rest.
+    # Queried rather than read off the group: PublishGroup has no destinations
+    # relationship, and in an async session a lazy load would raise instead of
+    # returning an empty list — the "already added" flag would take the whole
+    # route down.
+    known = {
+        str(r) for r in (await session.execute(
+            select(PublishDestination.provider_account_ref)
+            .where(PublishDestination.publish_group_id == group.id))
+        ).scalars().all()
+    }
+    return {
+        "provider": group.provider, "slot": slot,
+        # `raw` is dropped, not forwarded. It is the provider's whole account
+        # object, and a connected-account record is exactly where a platform
+        # OAuth token lives — forwarding it would put one in a browser to save
+        # the operator nothing. The named fields below are all the UI renders.
+        "accounts": [{k: v for k, v in a.items() if k != "raw"}
+                     | {"registered": str(a.get("ref")) in known}
+                     for a in accounts],
+    }
+
+
 @router.delete("/groups/{group_id}/credential")
 async def revoke_credential(group_id: str,
                             kind: str = Query("api_key"),
+                            slot: Optional[str] = Query(None),
+                            all_slots: bool = Query(False),
                             ident: AdminIdentity = Depends(require_publishing_admin),
                             session=Depends(db.get_db)):
-    """Revoke this group's credential. Queued posts then park, not fail.
+    """Revoke a credential. Queued posts then park, not fail.
 
     Dispatch treats "no usable credential" as a deferral rather than a failure,
     so revoking a compromised key stops publishing without burning the retry
     budget of everything already queued.
+
+    Scope, narrowest first: ``slot=<label>`` revokes that one provider account,
+    no argument revokes the group default, and ``all_slots=true`` revokes every
+    account in the batch. The default is the narrow one on purpose — this is the
+    destructive direction, and "revoke the key" on a two-account batch should not
+    quietly take out an account the operator was not looking at.
     """
     group = await _get_group(session, group_id)
-    rows = (await session.execute(
-        select(PublishCredential).where(
-            PublishCredential.publish_group_id == group.id,
-            PublishCredential.kind == kind,
-            PublishCredential.revoked_at.is_(None)))).scalars().all()
+    slot = (slot or "").strip() or None
+    q = select(PublishCredential).where(
+        PublishCredential.publish_group_id == group.id,
+        PublishCredential.kind == kind,
+        PublishCredential.revoked_at.is_(None))
+    if not all_slots:
+        q = q.where(PublishCredential.credential_slot.is_(None) if slot is None
+                    else PublishCredential.credential_slot == slot)
+    rows = (await session.execute(q)).scalars().all()
     for row in rows:
         row.active = False
         row.revoked_at = _now()
-    await service.log_event(session, "credential.revoked",
-                            message=f"{len(rows)} {kind} credential(s) revoked",
-                            group_id=group.id, actor=ident.label)
+    scope = ("every account" if all_slots
+             else f"account “{slot}”" if slot else "the default account")
+    await service.log_event(
+        session, "credential.revoked",
+        message=f"{len(rows)} {kind} credential(s) revoked for {scope}",
+        group_id=group.id, actor=ident.label,
+        data={"kind": kind, "slot": slot, "all_slots": all_slots})
     await session.commit()
     return {"revoked": len(rows)}
 
@@ -413,11 +577,23 @@ async def create_destination(group_id: str, body: DestinationCreate,
     a provider limitation, not a shortcut: the only way to confirm a destination
     is to post to it, and doing that silently during setup would put content on a
     real audience.
+
+    ``credential_slot`` names which of the group's provider accounts holds this
+    social account — the whole point of the multi-account shape. It is NOT
+    required to exist yet: an operator legitimately maps destinations before
+    pasting the second key, and the dispatcher parks with a readable "no usable
+    credential for account X" instead of guessing.
     """
     group = await _get_group(session, group_id)
     platform = plat.normalize(body.platform)
     if not platform:
         raise HTTPException(400, "platform is required")
+
+    slot = body.credential_slot
+    if slot and not _multi_credential(group.provider):
+        raise HTTPException(
+            400, f"{group.provider} uses one API key per batch, so a credential "
+                 "slot would never be resolved. Leave it empty.")
 
     caps = getattr(providers.get(group.provider), "capabilities", None)
     supported = list(getattr(caps, "platforms", ()) or ())
@@ -430,6 +606,7 @@ async def create_destination(group_id: str, body: DestinationCreate,
         publish_group_id=group.id, provider=group.provider, platform=platform,
         provider_account_ref=body.provider_account_ref.strip(),
         display_name=(body.display_name or "").strip() or None,
+        credential_slot=slot,
         enabled=body.enabled, health="unverified",
         health_detail="not yet confirmed by a publish",
         settings=body.settings or {})
@@ -446,8 +623,10 @@ async def create_destination(group_id: str, body: DestinationCreate,
 
     await service.log_event(
         session, "destination.created",
-        message=f"{platform}:{dest.provider_account_ref}",
-        destination_id=dest.id, group_id=group.id, actor=ident.label)
+        message=f"{platform}:{dest.provider_account_ref}"
+                + (f" (account “{slot}”)" if slot else ""),
+        destination_id=dest.id, group_id=group.id, actor=ident.label,
+        data={"slot": slot})
     await session.commit()
     return views.destination_out(dest)
 
@@ -468,13 +647,25 @@ async def update_destination(destination_id: str, body: DestinationUpdate,
     ``reset_health`` clears ``blocked`` after fixing a disconnected account at
     the platform without deleting and recreating the destination (which would
     orphan its publication history).
+
+    ``credential_slot`` moves the destination to a different provider account
+    inside the same batch. Guarded by the same in-flight check as
+    ``provider_account_ref``, and for a sharper reason: a SUBMITTED attempt is
+    reconciled with the key that created it, so swapping the key underneath it
+    would make ``fetch_status`` ask the wrong account about a post it has never
+    heard of and read the answer as "gone".
     """
     dest = await session.get(PublishDestination,
                              _uuid_or_404(destination_id, "destination"))
     if dest is None:
         raise HTTPException(404, "destination not found")
 
-    if body.provider_account_ref is not None:
+    # "" and null both arrive as None; only a field that was actually present in
+    # the body means "change this", and only then does clearing it to the group
+    # default happen. Without this the field could never be un-set.
+    slot_change = "credential_slot" in body.model_fields_set
+
+    async def _refuse_if_in_flight(what: str):
         live = (await session.execute(
             select(func.count()).select_from(PublishAttempt).where(
                 PublishAttempt.publish_destination_id == dest.id,
@@ -484,8 +675,12 @@ async def update_destination(destination_id: str, body: DestinationUpdate,
         ).scalar_one()
         if live:
             raise HTTPException(
-                409, f"{live} attempt(s) for this destination are in flight. "
-                     "Wait for them to finish, or disable the destination first.")
+                409, f"{live} attempt(s) for this destination are in flight, so "
+                     f"{what} cannot change yet. Wait for them to finish, or "
+                     "disable the destination first.")
+
+    if body.provider_account_ref is not None:
+        await _refuse_if_in_flight("the account reference")
         old = dest.provider_account_ref
         dest.provider_account_ref = body.provider_account_ref.strip()
         await service.log_event(
@@ -493,6 +688,20 @@ async def update_destination(destination_id: str, body: DestinationUpdate,
             message=f"{dest.platform} {old} → {dest.provider_account_ref}",
             destination_id=dest.id,
             group_id=dest.publish_group_id, actor=ident.label)
+    if slot_change and (body.credential_slot or None) != dest.credential_slot:
+        slot = body.credential_slot
+        if slot and not _multi_credential(dest.provider):
+            raise HTTPException(
+                400, f"{dest.provider} uses one API key per batch, so a "
+                     "credential slot would never be resolved.")
+        await _refuse_if_in_flight("the provider account")
+        old = dest.credential_slot
+        dest.credential_slot = slot
+        await service.log_event(
+            session, "destination.slot_changed",
+            message=f"{dest.platform}: {old or 'default'} → {slot or 'default'}",
+            destination_id=dest.id, group_id=dest.publish_group_id,
+            actor=ident.label, data={"from": old, "to": slot})
     if body.display_name is not None:
         dest.display_name = body.display_name.strip() or None
     if body.enabled is not None:

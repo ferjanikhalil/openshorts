@@ -1,8 +1,12 @@
 """Inbound provider callbacks.
 
-Webhooks are the ONLY completion signal for a submitted post: the provider has no
-verified status-lookup endpoint, so there is no polling fallback to lean on. That
-makes this module load-bearing, and it shapes two decisions:
+For a provider with no status-lookup endpoint, webhooks are the ONLY completion
+signal for a submitted post — there is no polling fallback to lean on. Status 200
+is such a provider, which is what makes this module load-bearing rather than an
+optimization. (Zernio does expose a lookup, so there a lost callback degrades to
+"confirmed a minute later by the reconciler" instead of "aged into unknown".)
+
+That shapes two decisions:
 
 **Persist and ack, interpret later.** The provider requires a 2xx within ~5
 seconds and retries at 1m/5m/30m. Doing the correlation work inline would risk a
@@ -15,15 +19,20 @@ mechanisms cover that gap and both are required — a UNIQUE constraint on
 ``(provider, provider_event_id)`` makes a replay a no-op, and a ``created_at``
 skew window bounds how old a first-time event may be.
 
-Signature verification is per-group, because each group has its own credential
-and therefore its own signing secret. With no group hint in the payload, the
-handler tries each group's secret; the one that verifies also identifies the
-group, which is exactly the property a shared secret gives you.
+Signature verification is per-credential, because each provider account has its
+own signing secret. With no group hint in the payload, the handler tries every
+stored secret for the provider; the one that verifies also identifies the group,
+which is exactly the property a shared secret gives you. A multi-account group
+therefore works without special-casing: it simply has more than one candidate.
+
+Nothing here knows a provider name. Which header carries the signature and how
+the digest is encoded are both read from the adapter — hardcoding either would
+reject a second provider's callbacks as unsigned, silently.
 """
 from datetime import datetime, timezone
 import time
 
-from fastapi import APIRouter, Header, Request, Response
+from fastapi import APIRouter, Request, Response
 from sqlalchemy import select
 
 from . import crypto, db, service, state
@@ -33,7 +42,9 @@ from .models import (
     PublishAttempt, PublishCredential, PublishDestination, ProviderWebhookEvent,
 )
 from . import providers
-from .signing import verify_webhook_signature, within_skew
+from .signing import (
+    WEBHOOK_SIGNATURE_HEADER, verify_webhook_signature, within_skew,
+)
 
 router = APIRouter()
 
@@ -61,15 +72,31 @@ def _should_log_rejection() -> bool:
 # Mounted under api.router's "/api/publishing" prefix, so the public URL is
 # /api/publishing/webhook/{provider}. Relative here so the prefix has one home.
 @router.post("/webhook/{provider_name}")
-async def receive_webhook(provider_name: str, request: Request,
-                          x_webhook_signature: str = Header(default="")):
-    """Verify, persist, ack. No correlation work happens here."""
+async def receive_webhook(provider_name: str, request: Request):
+    """Verify, persist, ack. No correlation work happens here.
+
+    The provider is resolved FIRST because two things about verification are
+    provider-specific and neither may be hardcoded: which header carries the
+    signature (Status 200 signs ``X-Webhook-Signature``, Zernio signs
+    ``X-Zernio-Signature``) and how the digest is encoded. Reading a fixed header
+    name would reject every callback from the second provider as unsigned — a
+    silent failure whose only symptom is that posts stop being confirmed.
+    """
     raw = await request.body()
+
+    try:
+        provider = providers.get(provider_name)
+    except KeyError:
+        return Response(status_code=404,
+                        content='{"error":"unknown provider"}',
+                        media_type="application/json")
+
+    signature, header_name = _presented_signature(provider, request)
 
     async with db.session() as session:
         async with session.begin():
             group_id, secret_ok, any_secret = await _verify_against_groups(
-                session, provider_name, raw, x_webhook_signature)
+                session, provider_name, raw, signature, provider)
 
             if not secret_ok:
                 # 401, and the body is NOT written: an unverified body is
@@ -88,11 +115,12 @@ async def receive_webhook(provider_name: str, request: Request,
                             if not any_secret else
                             "callback signature did not match any configured "
                             "webhook secret"
-                            if x_webhook_signature else
-                            "callback arrived with no X-Webhook-Signature header"
+                            if signature else
+                            f"callback arrived with no {header_name} header"
                         ),
                         data={"provider": provider_name,
-                              "has_signature": bool(x_webhook_signature),
+                              "has_signature": bool(signature),
+                              "signature_header": header_name,
                               "secrets_configured": any_secret})
                 return Response(status_code=401, content='{"error":"invalid signature"}',
                                 media_type="application/json")
@@ -102,13 +130,6 @@ async def receive_webhook(provider_name: str, request: Request,
             except Exception:
                 return Response(status_code=400,
                                 content='{"error":"invalid json"}',
-                                media_type="application/json")
-
-            try:
-                provider = providers.get(provider_name)
-            except KeyError:
-                return Response(status_code=404,
-                                content='{"error":"unknown provider"}',
                                 media_type="application/json")
 
             event = provider.parse_webhook(payload)
@@ -158,8 +179,26 @@ async def receive_webhook(provider_name: str, request: Request,
                     media_type="application/json")
 
 
+def _presented_signature(provider, request: Request):
+    """The signature header this provider signs with, and its value.
+
+    Returns ``(value, header_name)``. The declared header is authoritative; the
+    generic ``X-Webhook-Signature`` is tried as a fallback so a provider that
+    quietly renames its header degrades to "still verified" rather than "every
+    callback rejected". Both are checked against the same secret, so a fallback
+    match is no weaker than a declared one.
+    """
+    declared = getattr(getattr(provider, "capabilities", None),
+                       "signature_header", None) or WEBHOOK_SIGNATURE_HEADER
+    for name in (declared, WEBHOOK_SIGNATURE_HEADER):
+        value = (request.headers.get(name) or "").strip()
+        if value:
+            return value, declared
+    return "", declared
+
+
 async def _verify_against_groups(session, provider_name: str, raw: bytes,
-                                 signature: str):
+                                 signature: str, provider=None):
     """Find the group whose signing secret validates this body.
 
     Returns ``(group_id, matched, any_secret_configured)``. The third value is
@@ -170,7 +209,19 @@ async def _verify_against_groups(session, provider_name: str, raw: bytes,
     Every configured secret is tried even after a match, so the work done is
     independent of which group matched — a timing side channel here would leak
     which of the operator's groups a probe belongs to.
+
+    Verification itself belongs to the adapter when it offers one: providers
+    disagree on the digest encoding, and Status 200's proven hex path must not
+    change to accommodate a provider that does not document its own.
+
+    A multi-account group holds one secret PER provider account, and this already
+    handles that: it iterates every active ``webhook_secret`` row for the
+    provider, so both of a group's secrets are candidates and either verifies.
     """
+    verify = getattr(provider, "verify_signature", None) if provider else None
+    if verify is None:
+        verify = verify_webhook_signature
+
     rows = (await session.execute(
         select(PublishCredential).where(
             PublishCredential.provider == provider_name,
@@ -195,7 +246,7 @@ async def _verify_against_groups(session, provider_name: str, raw: bytes,
             print(f"⚠️  Publishing: unreadable webhook secret "
                   f"{cred.id}: {crypto.scrub(str(e))}")
             continue
-        if verify_webhook_signature(secret.reveal(), raw, signature) and not matched:
+        if verify(secret.reveal(), raw, signature) and not matched:
             matched = True
             matched_group = cred.publish_group_id
     return matched_group, matched, bool(rows)

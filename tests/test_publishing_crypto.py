@@ -251,3 +251,85 @@ class TestMasterKeyValidation:
         import os
         assert len(decode_master_key(
             base64.b64encode(os.urandom(32)).decode())) == 32
+
+
+class TestCredentialAad:
+    """The AAD string itself, pinned.
+
+    ``_credential_aad`` builds what GCM authenticates, so its output is a storage
+    format, not an implementation detail: every credential already in a database
+    was sealed against the exact bytes this function returned on the day it was
+    entered. Changing the formula for an existing case makes those rows
+    undecryptable and unrecoverable without re-entry, so the strings are asserted
+    literally rather than round-tripped.
+    """
+
+    GROUP = "7c9f1e2a-0000-4000-8000-000000000001"
+
+    @pytest.fixture(autouse=True)
+    def _aad(self):
+        pytest.importorskip("fastapi")
+        pytest.importorskip("sqlalchemy")
+        from publishing.admin_api import _credential_aad
+        self.aad = _credential_aad
+
+    def test_the_legacy_unslotted_string_is_unchanged_byte_for_byte(self):
+        """Every pre-slots credential was sealed against exactly this.
+
+        Appending ``|slot:None`` unconditionally when slots were added would have
+        changed the AAD of every existing row; GCM would refuse to open them and
+        each would surface at dispatch as ``credential_unreadable`` —
+        indistinguishable from a rotated master key, for keys that are perfectly
+        fine.
+        """
+        assert self.aad(self.GROUP, "api_key", "status200") == (
+            f"group:{self.GROUP}|kind:api_key|provider:status200")
+
+    def test_an_explicit_none_slot_is_the_same_string_as_no_slot(self):
+        # The group default is the unslotted credential — same question, and it
+        # must not seal differently depending on which caller asked.
+        assert self.aad(self.GROUP, "api_key", "zernio", None) == \
+            self.aad(self.GROUP, "api_key", "zernio")
+
+    def test_an_empty_or_whitespace_slot_is_also_the_default(self):
+        # A blank form field must not create a credential nothing can resolve.
+        assert self.aad(self.GROUP, "api_key", "zernio", "") == \
+            self.aad(self.GROUP, "api_key", "zernio")
+        assert self.aad(self.GROUP, "api_key", "zernio", "   ") == \
+            self.aad(self.GROUP, "api_key", "zernio")
+
+    def test_a_named_slot_appends_exactly_one_segment(self):
+        assert self.aad(self.GROUP, "api_key", "zernio", "zernio-b") == (
+            f"group:{self.GROUP}|kind:api_key|provider:zernio|slot:zernio-b")
+
+    def test_each_dimension_binds_independently(self):
+        base = self.aad(self.GROUP, "api_key", "zernio", "zernio-a")
+        assert base != self.aad(self.GROUP, "webhook_secret", "zernio",
+                                "zernio-a")
+        assert base != self.aad(self.GROUP, "api_key", "status200", "zernio-a")
+        assert base != self.aad(self.GROUP, "api_key", "zernio", "zernio-b")
+        assert base != self.aad("00000000-0000-4000-8000-000000000002",
+                                "api_key", "zernio", "zernio-a")
+
+    def test_a_key_moved_between_slots_in_the_database_will_not_open(self, key_a):
+        """What the slot segment actually buys.
+
+        A group now holds several provider accounts. Without the slot in the AAD,
+        moving a ciphertext from one slot's row to another's would decrypt
+        cleanly and publish to the wrong account under the wrong key.
+        """
+        sealed = crypto.encrypt(
+            SECRET, aad=self.aad(self.GROUP, "api_key", "zernio", "zernio-a"))
+        moved = dict(sealed,
+                     aad=self.aad(self.GROUP, "api_key", "zernio", "zernio-b"))
+        with pytest.raises(InvalidTag):
+            crypto.decrypt(moved)
+        # ...and still opens in its own slot.
+        assert crypto.decrypt(sealed).reveal() == SECRET
+
+    def test_a_slotted_blob_cannot_pose_as_the_group_default(self, key_a):
+        sealed = crypto.encrypt(
+            SECRET, aad=self.aad(self.GROUP, "api_key", "zernio", "zernio-a"))
+        with pytest.raises(InvalidTag):
+            crypto.decrypt(dict(sealed,
+                                aad=self.aad(self.GROUP, "api_key", "zernio")))

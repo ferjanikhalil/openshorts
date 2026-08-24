@@ -13,6 +13,8 @@ Two rules encoded here rather than left to convention:
 from datetime import datetime
 from typing import List, Optional
 
+import re
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -37,16 +39,47 @@ class GroupOut(BaseModel):
     enabled: bool
     settings: Optional[dict] = None
     created_at: Optional[datetime] = None
-    # Masked credential view — never the key itself.
+    # Masked credential view — never the key itself. This is the group's DEFAULT
+    # (unslotted) key.
     credential: Optional[dict] = None
+    # Every key in the group: the default first, then one per named slot. A
+    # single-account provider yields a one-element list.
+    credentials: List[dict] = Field(default_factory=list)
     # Same masking for the webhook signing secret. Present/absent is the fact the
     # UI acts on: without it, no provider callback can be verified.
     webhook_secret: Optional[dict] = None
+    # One per provider account, for the same reason as `credentials`.
+    webhook_secrets: List[dict] = Field(default_factory=list)
     # Callback URL to paste into the provider dashboard; None when no public
     # origin is configured.
     webhook_url: Optional[str] = None
     destinations: List[dict] = Field(default_factory=list)
     summary: Optional[dict] = None
+
+
+# A credential slot is an operator-typed label, and it lands in an index, an
+# encryption AAD and a log line. Keep it to the characters that survive all
+# three unambiguously — no spaces (a trailing one would silently make a second
+# slot), no case games (lowercased so "Zernio-A" and "zernio-a" are one slot).
+_SLOT_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
+
+
+def _clean_slot(v):
+    """Normalize a credential slot, or None for 'the group default'.
+
+    Empty string and None mean the same thing on the wire — the UI sends "" when
+    an operator clears the field — and both must collapse to NULL, because a
+    ``""`` slot would be a third, invisible category that no lookup matches.
+    """
+    if v is None:
+        return None
+    v = str(v).strip().lower()
+    if not v:
+        return None
+    if not _SLOT_RE.match(v):
+        raise ValueError(
+            "credential_slot must be 1-32 chars of a-z, 0-9, '-', '_' or '.'")
+    return v
 
 
 # --- Credentials ------------------------------------------------------------
@@ -55,6 +88,10 @@ class CredentialCreate(BaseModel):
 
     api_key: str = Field(min_length=8, max_length=500)
     kind: str = "api_key"
+    # Names ONE provider account inside the group, e.g. "zernio-a". Omitted (or
+    # empty) means the group's default key — the only shape that existed before
+    # multi-account support and the only one Status 200 uses.
+    credential_slot: Optional[str] = Field(default=None, max_length=32)
 
     @field_validator("api_key")
     @classmethod
@@ -62,6 +99,11 @@ class CredentialCreate(BaseModel):
         # Pasted keys routinely carry whitespace; a trailing newline would
         # produce a valid-looking row that 401s on every publish.
         return v.strip()
+
+    @field_validator("credential_slot")
+    @classmethod
+    def _slot(cls, v):
+        return _clean_slot(v)
 
     @field_validator("kind")
     @classmethod
@@ -77,6 +119,7 @@ class CredentialOut(BaseModel):
     id: str
     kind: str
     provider: str
+    credential_slot: Optional[str] = None
     fingerprint: str
     last4: str
     masked: str
@@ -95,14 +138,27 @@ class DestinationCreate(BaseModel):
     platform: str
     provider_account_ref: str = Field(min_length=1, max_length=255)
     display_name: Optional[str] = Field(default=None, max_length=255)
+    # Which of the group's provider accounts holds this social account. None =
+    # the group's default credential.
+    credential_slot: Optional[str] = Field(default=None, max_length=32)
     enabled: bool = True
     settings: Optional[dict] = None
+
+    @field_validator("credential_slot")
+    @classmethod
+    def _slot(cls, v):
+        return _clean_slot(v)
 
 
 class DestinationUpdate(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=255)
     enabled: Optional[bool] = None
     settings: Optional[dict] = None
+    # Re-pointing a destination at a different provider account. Sent as "" to
+    # move it back to the group default. The route distinguishes "absent" from
+    # "explicitly empty" via ``model_fields_set``, because both arrive as None
+    # here and only one of them means "change it".
+    credential_slot: Optional[str] = Field(default=None, max_length=32)
     # Correcting a wrong account reference has to be possible without deleting
     # the destination, because deleting cascades to its attempts and would erase
     # the record of anything already posted. Providers identify accounts by
@@ -117,6 +173,11 @@ class DestinationUpdate(BaseModel):
     # orphan its publication history).
     reset_health: bool = False
 
+    @field_validator("credential_slot")
+    @classmethod
+    def _slot(cls, v):
+        return _clean_slot(v)
+
 
 class DestinationOut(BaseModel):
     id: str
@@ -125,6 +186,7 @@ class DestinationOut(BaseModel):
     platform: str
     provider_account_ref: str
     display_name: Optional[str] = None
+    credential_slot: Optional[str] = None
     enabled: bool
     health: str
     health_detail: Optional[str] = None

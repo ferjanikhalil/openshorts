@@ -43,9 +43,13 @@ from .errors import (
 from .models import PublishAttempt, PublishDestination, PublishMedia
 from .providers.base import PublishPayload
 
-# One semaphore per credential, created on demand. Keyed by group because the
-# credential is per group.
-_group_locks = {}
+# One semaphore per credential, created on demand. Keyed by the CREDENTIAL row,
+# not the group: the thing being protected is a provider account's rate limit, and
+# a group can now hold several accounts (see PublishCredential.credential_slot).
+# Keying on the group would serialize two independent Zernio accounts against each
+# other for no reason — a 3-platform fan-out that could go out in one pass would
+# take three.
+_credential_locks = {}
 _global_semaphore = None
 
 # Media registration is the one step that transfers the clip's whole body: the
@@ -125,12 +129,17 @@ def global_semaphore() -> asyncio.Semaphore:
     return _global_semaphore
 
 
-def group_semaphore(group_id) -> asyncio.Semaphore:
-    key = str(group_id)
-    sem = _group_locks.get(key)
+def credential_semaphore(credential_id) -> asyncio.Semaphore:
+    """Bound concurrent submits per provider account.
+
+    Falls back to a shared key when there is no credential id, which only
+    happens on the dry-run path — one bucket is the right answer there.
+    """
+    key = str(credential_id) if credential_id else "-"
+    sem = _credential_locks.get(key)
     if sem is None:
         sem = asyncio.Semaphore(settings.per_credential_concurrency)
-        _group_locks[key] = sem
+        _credential_locks[key] = sem
     return sem
 
 
@@ -301,7 +310,7 @@ async def dispatch_attempt(session, attempt: PublishAttempt,
             E_MEDIA_TOO_LARGE, reason))
         return "too_large"
 
-    credential = await service.active_credential(session, dest.publish_group_id)
+    credential = await service.credential_for_destination(session, dest)
     if credential is None:
         # Parking (rather than failing) is deliberate: the operator can still fix
         # the key and every queued post goes out. But this path consumes no try,
@@ -310,27 +319,36 @@ async def dispatch_attempt(session, attempt: PublishAttempt,
         # 12:38" for eleven hours with nothing on the provider and no reason
         # visible anywhere. The reason goes on the attempt, and the audit line is
         # written once per attempt instead of once per tick.
-        rejected = await service.active_credential(
-            session, dest.publish_group_id, include_invalid=True)
+        #
+        # The slot is named in every message below. On a multi-account group
+        # "this group has no API key" would be actively misleading: the group has
+        # a key, just not for the account THIS destination publishes through, and
+        # the fix is a different field in a different row.
+        slot = (dest.credential_slot or "").strip()
+        whose = f"account “{slot}”" if slot else "this group"
+        rejected = await service.credential_for_destination(
+            session, dest, include_invalid=True)
         if rejected is not None:
-            why = ("the provider rejected this group's API key, so nothing can "
-                   "be sent. Re-check or replace it under Publishing → this "
-                   "group → credential; the post is held, not lost.")
+            why = (f"the provider rejected the API key for {whose}, so nothing "
+                   f"can be sent. Re-check or replace it under Publishing → "
+                   f"this group → credential; the post is held, not lost.")
             if rejected.invalid_reason:
                 why = f"{why} Provider said: {rejected.invalid_reason[:300]}"
         else:
-            why = ("this group has no API key, so nothing can be sent. Add one "
-                   "under Publishing → this group → credential; the post is "
-                   "held, not lost.")
+            why = (f"there is no API key stored for {whose}, so nothing can be "
+                   f"sent. Add one under Publishing → this group → credential; "
+                   f"the post is held, not lost.")
         first = attempt.error_code != "no_credential"
         await service.release_claim(session, attempt, defer_seconds=900,
                                     reason=why, code="no_credential")
         if first:
             await service.log_event(
                 session, "dispatch.no_credential",
-                message="no usable API key for this group",
+                message=f"no usable API key for {whose}",
                 request_id=attempt.publish_request_id, attempt_id=attempt.id,
-                group_id=dest.publish_group_id)
+                destination_id=dest.id,
+                group_id=dest.publish_group_id,
+                data={"slot": slot or None})
         return "no_credential"
 
     try:
@@ -357,11 +375,19 @@ async def dispatch_attempt(session, attempt: PublishAttempt,
         return "credential_unreadable"
 
     provider = providers.get(dest.provider)
+    by_ref = bool(getattr(provider.capabilities, "supports_media_refs", False))
 
-    # 6. Media ref — uploaded once per (group, content), reused across platforms.
+    # 6. Media. Two shapes, one for each half of the capability matrix:
+    #    ref-based — upload once per (group, content) and reuse the ref across
+    #    platforms; ref-less — hand over a presigned URL and let the provider
+    #    fetch at submit time. Both raise the same errors, so the handling below
+    #    is shared.
+    media_url = None
     try:
         media_row = await ensure_media_ref(
             session, provider, api_key.reveal(), dest, req, info)
+        if not by_ref:
+            media_url = await ensure_media_url(req, info)
     except ProviderError as err:
         if err.code == E_MEDIA_PENDING:
             # The clip is still being copied to the object store the provider
@@ -382,12 +408,19 @@ async def dispatch_attempt(session, attempt: PublishAttempt,
                     request_id=attempt.publish_request_id,
                     attempt_id=attempt.id, group_id=dest.publish_group_id)
             return "media_pending"
-        if err.code == E_MEDIA_UNFETCHABLE:
+        if err.code == E_MEDIA_UNFETCHABLE and by_ref:
             # At the REGISTRATION step, "provider could not download our URL" is
             # almost always origin congestion (the tunnel saturating, observed
             # 2026-08-15), not a permanent property of the clip. The post was
             # never created, so retrying with backoff is safe; classifying it
             # permanent here is what killed a whole day's posts in one incident.
+            #
+            # Scoped to the ref-based path on purpose. A ref-less provider has
+            # not been asked for anything yet, so the same code there means
+            # something entirely different — we could not produce a URL at all,
+            # which is a store/origin misconfiguration and not congestion. Calling
+            # that "will retry with backoff" would retry a config error five times
+            # and describe it wrongly each time.
             err = ProviderError(
                 E_NETWORK,
                 f"provider could not fetch the media URL yet — likely origin "
@@ -419,14 +452,14 @@ async def dispatch_attempt(session, attempt: PublishAttempt,
         caption=caption,
         title=title,
         media_ref=media_row.provider_media_ref if media_row else None,
-        media_url=None if media_row else info.get("public_url"),
+        media_url=media_url,
         scheduled_for=remote_time,
         options=options,
     )
 
     # 7. Submit.
     async with global_semaphore():
-        async with group_semaphore(dest.publish_group_id):
+        async with credential_semaphore(credential.id):
             try:
                 result = await provider.submit(api_key.reveal(), payload)
             except ProviderError as err:
@@ -517,6 +550,14 @@ async def ensure_media_ref(session, provider, api_key: str,
     across keys is later confirmed, widening this key is a one-line change with
     no schema impact.
 
+    That scope has one edge it does not cover: a provider that is BOTH ref-based
+    and multi-credential (several provider accounts in one group) would share one
+    ref across two accounts, and an account-scoped ref would fail on the second.
+    No provider is both today — Status 200 is single-credential, Zernio is
+    ref-less — and ``Capabilities`` states each half, so the combination is
+    checkable rather than latent. It would need ``credential_slot`` on the cache
+    key, which is a schema change; hence the note instead of the code.
+
     A near-expiry ref is re-uploaded rather than used: refs roll off after 7 days
     and a scheduled post must never submit a dead one.
     """
@@ -587,6 +628,37 @@ async def ensure_media_ref(session, provider, api_key: str,
     return row
 
 
+async def ensure_media_url(req, info: dict) -> str:
+    """Presigned URL for a provider that takes media by URL and keeps no ref.
+
+    The counterpart to ``ensure_media_ref`` for the other half of the capability
+    matrix. There is nothing to cache and nothing to register: the URL goes
+    straight into the submit body and the provider fetches from it, so this is a
+    signing call against the staged object, not a transfer.
+
+    Which makes the TTL the load-bearing part. It is the long provider TTL (7
+    days), not the short one used for browser playback, because a scheduled post
+    hands this URL over now and the provider downloads at the slot — hours or
+    days later. A one-hour URL here is a post that looks perfectly healthy until
+    the moment it goes out and then fails with "could not download".
+    """
+    fingerprint = info.get("fingerprint") or req.content_fingerprint
+    if not fingerprint:
+        raise ProviderError(E_VALIDATION, "clip has no content fingerprint")
+    public_url, strategy = await media.public_url_for_clip(
+        req.job_id, req.clip_index, info["filename"],
+        fingerprint=fingerprint, user_id=info.get("user_id"),
+        ttl_seconds=settings.provider_media_url_ttl_seconds)
+    if media.is_pending(strategy):
+        # Still copying to the store. The caller parks without consuming a try.
+        raise ProviderError(E_MEDIA_PENDING, strategy)
+    if not public_url:
+        raise ProviderError(
+            E_MEDIA_UNFETCHABLE,
+            f"cannot expose the clip to the provider: {strategy}")
+    return public_url
+
+
 # Pre-registration backoff: a clip whose registration failed PERMANENTLY (too
 # large, unfetchable for a structural reason) must not be retried every tick.
 # In-memory because this is an optimization, not state: dispatch re-checks and
@@ -633,6 +705,19 @@ async def preregister_next_media(session) -> int:
         if skip and skip["until"] > now:
             continue
 
+        try:
+            provider = providers.get(attempt.provider)
+        except KeyError:
+            continue
+        if not getattr(provider.capabilities, "supports_media_refs", False):
+            # Nothing to pre-register: this provider takes media by URL at submit
+            # time and keeps no ref. Skipping is not merely an optimisation —
+            # without it ``ensure_media_ref`` returns None, no PublishMedia row is
+            # ever written, so the ``have`` check below can never become true and
+            # this pass would report a fresh "media.preregistered" every single
+            # tick, forever, for a registration that did not happen.
+            continue
+
         info = clips.resolve(req.job_id, req.clip_index)
         if info is None or not info.get("filename"):
             # Skip, and let dispatch decide what it means: a permanent failure
@@ -660,8 +745,12 @@ async def preregister_next_media(session) -> int:
         if dest is None:
             continue
 
-        credential = await service.active_credential(
-            session, dest.publish_group_id)
+        # Through the destination, not the group: the arbitrary destination
+        # picked above may name a credential slot, and a group-wide lookup could
+        # hand back a different provider account's key. Registering a ref under
+        # the wrong account is how a ref that is account-scoped fails at submit
+        # time, days later, on a post that pre-registered cleanly.
+        credential = await service.credential_for_destination(session, dest)
         if credential is None:
             continue
         try:
@@ -676,7 +765,6 @@ async def preregister_next_media(session) -> int:
                   f"for group {dest.publish_group_id}: {crypto.scrub(str(e))}")
             return 0
 
-        provider = providers.get(dest.provider)
         try:
             await ensure_media_ref(session, provider, api_key.reveal(),
                                    dest, req, info)
@@ -768,6 +856,186 @@ async def promote_remote_schedules(session) -> int:
     if promoted:
         await session.flush()
     return promoted
+
+
+async def poll_submitted_attempts(session) -> int:
+    """Ask a pollable provider whether each submitted post has gone live.
+
+    The counterpart to ``sweep_stale_submitted`` and the reason it now runs
+    first. For years the ONLY completion signal was a webhook, because the only
+    provider had no status endpoint; a post whose callback was lost had exactly
+    one ending — the sweeper aged it into ``unknown`` after
+    ``submit_timeout_seconds`` and a human had to go and look at the account.
+
+    A provider that declares ``supports_status_lookup`` can simply be asked, so
+    this pass resolves such a post the moment it is due instead of condemning it.
+    It changes nothing for Status 200 (``supports_status_lookup=False``): its
+    attempts never match the provider filter, so the sweeper stays their only
+    backstop.
+
+    Safety is inherited, not re-derived. ``fetch_status`` returns a
+    ``SubmitResult`` whose ``status`` is exactly what a submit returns, so the
+    outcomes below route through the SAME service calls a submit or a webhook
+    would — ``record_success`` for a confirmed post, ``record_failure`` for a
+    definite failure (which never fires on an ambiguous one, because the adapter
+    raises ``E_UNKNOWN`` for that and it lands in the ambiguous branch and stays
+    ``unknown``). Nothing here invents a transition the state machine forbids.
+
+    Rate-limited three ways so a flapping provider cannot become a request flood:
+    a post is left alone until ``status_poll_min_age_seconds`` after submit, then
+    re-asked no more than once per ``status_poll_interval_seconds`` (both
+    enforced by the persisted ``last_polled_at``, which survives a restart), and
+    at most ``status_poll_batch`` posts are polled per pass because this is
+    serial provider I/O inside one transaction.
+    """
+    if not settings.status_poll_enabled:
+        return 0
+
+    now = _now()
+    min_age = timedelta(seconds=settings.status_poll_min_age_seconds)
+    interval = timedelta(seconds=settings.status_poll_interval_seconds)
+
+    # A submitted attempt with a provider ref, old enough to be worth asking
+    # about and not asked too recently. A future `deferred_until` is a post the
+    # provider deliberately parked for a later window (a daily-cap 202) — silence
+    # before then is expected, so it is skipped exactly as the sweeper skips it.
+    rows = (await session.execute(
+        select(PublishAttempt)
+        .where(PublishAttempt.status == state.SUBMITTED,
+               PublishAttempt.provider_post_ref.is_not(None),
+               PublishAttempt.submitted_at.is_not(None),
+               PublishAttempt.submitted_at < now - min_age,
+               (PublishAttempt.last_polled_at.is_(None))
+               | (PublishAttempt.last_polled_at < now - interval),
+               (PublishAttempt.deferred_until.is_(None))
+               | (PublishAttempt.deferred_until < now))
+        .order_by(PublishAttempt.last_polled_at.asc().nulls_first(),
+                  PublishAttempt.submitted_at.asc())
+        .limit(settings.status_poll_batch)
+        .with_for_update(skip_locked=True)
+    )).scalars().all()
+
+    polled = 0
+    for attempt in rows:
+        # The SQL above already applied these three gates; this re-check is the
+        # authority. `state.poll_is_due` is the pure, CI-testable statement of the
+        # rule, and re-asking it here means a drift between the query and the
+        # policy can only ever skip a poll, never add one.
+        if not state.poll_is_due(
+                now,
+                submitted_at=attempt.submitted_at,
+                last_polled_at=attempt.last_polled_at,
+                deferred_until=attempt.deferred_until,
+                min_age_seconds=settings.status_poll_min_age_seconds,
+                interval_seconds=settings.status_poll_interval_seconds):
+            continue
+        try:
+            provider = providers.get(attempt.provider)
+        except KeyError:
+            continue
+        if not getattr(provider.capabilities, "supports_status_lookup", False):
+            # Not pollable. Left for the stale sweeper. Not stamped, so if the
+            # provider gains the capability later this post is not stuck looking
+            # freshly polled.
+            continue
+
+        lookup = getattr(provider, "fetch_status", None)
+        if lookup is None:
+            continue
+
+        # The credential is resolved through the destination, not the group: on a
+        # multi-account group the ref belongs to ONE provider account, and asking
+        # a different account about it earns a 404 that reads identically to a
+        # deleted post — a false negative that would age a live post into unknown.
+        dest = await session.get(
+            PublishDestination, attempt.publish_destination_id)
+        if dest is None:
+            continue
+        credential = await service.credential_for_destination(session, dest)
+        if credential is None:
+            # No usable key for this account right now. Dispatch's no_credential
+            # path already surfaces that on the row; polling has nothing to add
+            # and must not stamp, or a key fixed later would wait a full interval.
+            continue
+        try:
+            api_key = crypto.decrypt({
+                "key_version": credential.key_version,
+                "nonce_b64": credential.nonce_b64,
+                "ciphertext_b64": credential.ciphertext_b64,
+                "aad": credential.aad,
+            })
+        except Exception:
+            # Decrypt failures are dispatch's to report (credential_unreadable).
+            continue
+
+        # Stamp BEFORE the call, not after: an adapter that raises here (a 5xx on
+        # the status endpoint) must still count as "asked just now", or a provider
+        # erroring every lookup would be re-polled on every tick with no rate
+        # limit at all.
+        attempt.last_polled_at = now
+        polled += 1
+        try:
+            result = await lookup(api_key.reveal(), attempt.provider_post_ref)
+        except ProviderError as err:
+            if err.is_ambiguous:
+                # The lookup itself was inconclusive. Nothing changes; the post
+                # stays submitted and the sweeper remains its final backstop.
+                continue
+            # A classified failure reported by a status lookup describes the POST,
+            # not the request: the provider is telling us the publish did not
+            # happen. Route it through the same failure path a submit would, so a
+            # retryable code retries with backoff and a destination-fatal one
+            # (E_ACCOUNT_AUTH) marks the account for re-linking — the SUBMITTED ->
+            # BLOCKED move the state machine now permits.
+            await service.record_failure(session, attempt, err,
+                                         credential_id=credential.id)
+            continue
+        except Exception:
+            # An unclassified error asking about a post tells us nothing about the
+            # post. Leave it submitted; it was stamped, so not re-asked before the
+            # next interval.
+            continue
+
+        if result is None:
+            # "No information" — unreachable, or a 404 that a deleted post and a
+            # never-valid ref share. Not evidence of failure; left for the
+            # sweeper's unknown.
+            continue
+
+        if result.status == "succeeded":
+            # Applied like a webhook confirmation, NOT via record_success: that
+            # helper is the submit path and stamps `submitted_at = now`, which
+            # would rewrite when the post was handed over to when we happened to
+            # ask about it — the one timestamp an operator uses to reconstruct a
+            # lost callback. It also logs its own `attempt.succeeded`, so calling
+            # it here would double the audit line.
+            state.assert_transition(attempt.status, state.SUCCEEDED)
+            attempt.status = state.SUCCEEDED
+            attempt.completed_at = now
+            attempt.provider_native_post_ref = (
+                result.provider_native_post_ref
+                or attempt.provider_native_post_ref)
+            attempt.permalink = result.permalink or attempt.permalink
+            if dest.health == "unverified":
+                # Same reasoning as the submit path: with no listing or dry-run
+                # endpoint, a publish that demonstrably landed IS the
+                # verification.
+                dest.health = "ok"
+                dest.health_detail = "confirmed by a successful publish"
+                dest.verified_at = now
+            await service.log_event(
+                session, "attempt.succeeded",
+                message="confirmed by status poll",
+                request_id=attempt.publish_request_id, attempt_id=attempt.id,
+                destination_id=attempt.publish_destination_id,
+                group_id=attempt.publish_group_id)
+            await service.refresh_request_status(
+                session, attempt.publish_request_id)
+        # Any other status ("submitted", a draft) is "still pending": the post
+        # exists but has not resolved. Nothing to write beyond the stamp already
+        # applied; the next due pass asks again.
+
+    return polled
 
 
 async def _load_request(session, attempt: PublishAttempt):

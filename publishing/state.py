@@ -22,6 +22,7 @@ on a post that may already be live double-publishes to a real audience. A human
 decides.
 """
 import hashlib
+from datetime import timezone
 from typing import Iterable, Optional
 
 # --- Attempt states ---------------------------------------------------------
@@ -58,7 +59,16 @@ NEEDS_ATTENTION = frozenset({UNKNOWN, DEAD, BLOCKED})
 _ALLOWED_TRANSITIONS = {
     PENDING:   {IN_FLIGHT, DEFERRED, CANCELLED, SKIPPED, BLOCKED},
     IN_FLIGHT: {SUBMITTED, SUCCEEDED, FAILED, DEFERRED, BLOCKED, UNKNOWN},
-    SUBMITTED: {SUCCEEDED, FAILED, UNKNOWN},
+    # BLOCKED belongs here for the same reason it belongs under IN_FLIGHT: the
+    # provider can report "this account is not connected / needs re-linking" as
+    # the outcome of a post it already accepted, and that arrives AFTER the
+    # submit — through a `post.failed` webhook, or through a status poll. Without
+    # it `record_failure` raised on the transition, the webhook drain caught the
+    # exception and wrote `process_error`, and the completion signal was silently
+    # swallowed: the post then aged into `unknown` with a destination still
+    # marked healthy, so the next 26 posts of the day each rediscovered the same
+    # dead platform token.
+    SUBMITTED: {SUCCEEDED, FAILED, UNKNOWN, BLOCKED},
     DEFERRED:  {PENDING, CANCELLED, SKIPPED},
     FAILED:    {DEAD},           # exhausted retries
     # Terminal.
@@ -175,6 +185,62 @@ def backoff_seconds(attempt_number: int, *, base: int = 60, cap: int = 3600,
 
 def should_retry(attempt_number: int, max_attempts: int, retryable: bool) -> bool:
     return bool(retryable) and attempt_number < max_attempts
+
+
+# --- Polling policy ---------------------------------------------------------
+def _as_utc(value):
+    """Treat a naive timestamp as UTC.
+
+    Every column feeding this is ``DateTime(timezone=True)``, so a naive value
+    means the row was written by something that dropped the offset. Comparing it
+    to an aware ``now`` would raise TypeError inside the reconcile loop, which is
+    a worse outcome than assuming the timezone the whole system stores in.
+    """
+    if value is not None and value.tzinfo is None:  # pragma: no cover
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def poll_is_due(now, *, submitted_at, last_polled_at, deferred_until,
+                min_age_seconds: int, interval_seconds: int) -> bool:
+    """May this submitted post be asked about yet?
+
+    Pure, and split out for the same reason as ``service.claim_is_recoverable``:
+    it is the rule that bounds how much traffic the poller aims at a provider,
+    and it has to be verifiable without a database. ``dispatcher`` expresses the
+    same three conditions as a SQL ``WHERE`` so ``LIMIT`` selects useful rows,
+    then re-checks THIS function before spending a request — so if the two ever
+    drift, the disagreement can only skip a poll, never add one.
+
+    Three independent gates, all of which must pass:
+
+    * ``min_age_seconds`` since submit. Polling at t+2s spends a request to be
+      told what the submit response already said, and the provider is still
+      working. It must also stay well under ``submit_timeout_seconds`` or a post
+      would reach ``unknown`` before it was ever asked about.
+    * ``interval_seconds`` since the last poll. Reconciliation runs every 60s; a
+      post pending for an hour must cost ~12 requests, not 60. ``None`` means
+      never polled, which is due.
+    * no future ``deferred_until``. On a submitted row that timestamp is a window
+      the PROVIDER asked for (a daily-cap 202), so silence before it is expected
+      rather than suspicious — the same reading ``sweep_stale_submitted`` takes.
+    """
+    submitted_at = _as_utc(submitted_at)
+    if submitted_at is None:
+        # Nothing was handed over that we know of, so there is nothing to ask
+        # about — and no clock to measure the floor against.
+        return False
+    if (now - submitted_at).total_seconds() < max(0, int(min_age_seconds)):
+        return False
+
+    deferred_until = _as_utc(deferred_until)
+    if deferred_until is not None and deferred_until > now:
+        return False
+
+    last_polled_at = _as_utc(last_polled_at)
+    if last_polled_at is None:
+        return True
+    return (now - last_polled_at).total_seconds() >= max(0, int(interval_seconds))
 
 
 # --- Idempotency ------------------------------------------------------------

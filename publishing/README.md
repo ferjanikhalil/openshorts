@@ -4,18 +4,56 @@ Takes finished clips from the normal OpenShorts pipeline and posts them to
 YouTube Shorts, Instagram Reels and TikTok through a publishing provider. Off by
 default; the whole package is dormant unless `PUBLISHING_ENABLED` is set.
 
-The first (and so far only) provider adapter is **Status 200**. Nothing outside
-`providers/` knows its name.
+Two provider adapters ship: **Status 200** and **Zernio**. Nothing outside
+`providers/` knows either name — a group names its provider, and the registry
+resolves it. They differ in ways that change orchestration, not just wire format,
+and every one of those differences is declared in `Capabilities` rather than
+branched on: Zernio can be *asked* whether a post went live
+(`supports_status_lookup`), can *list* the accounts connected to a key
+(`supports_account_listing`), and genuinely *holds a schedule*
+(`supports_remote_schedule` + `supports_cancel_scheduled`). Status 200 can do
+none of the three.
 
 ## Vocabulary
 
 | Term | Means |
 |------|-------|
-| **publish group** | A reusable bundle of destinations sharing **one** provider credential. The UI calls it a *Batch*. |
+| **publish group** | A reusable bundle of destinations sharing one provider **and** one set of credentials. The UI calls it a *Batch*. |
+| **credential slot** | A named key *within* one group, so a group can hold several provider accounts. `NULL` means the group's default key. |
 | **publish destination** | ONE connected social account (platform + provider account ref). **This is the atomic publish target.** |
 | **publish request** | One user-visible publish operation for one clip. May span groups. |
 | **publish attempt** | One row per destination per try. **This is the publication record.** |
 | **assignment** | A clip earmarked for a group before anyone asked to publish it — the planning layer. |
+
+### Why a group holds more than one credential
+
+Zernio's free tier connects **two** social accounts per Zernio account, and a
+full fan-out needs three (TikTok, Instagram, YouTube). Splitting them across two
+*groups* would work at the provider and be wrong here: a group is the unit an
+operator schedules, assigns clips to and reads capacity for, so two groups means
+every one of those operations has to be done twice and kept in sync by hand.
+
+So the second key lives *inside* the group. Both `publish_credentials` and
+`publish_destinations` carry a nullable `credential_slot`, and
+`service.credential_for_destination` resolves **slot first, then the group
+default**. One logical batch, three destinations, two provider accounts:
+
+| destination | `credential_slot` | resolves to |
+|-------------|-------------------|-------------|
+| TikTok | `NULL` | the group's default key (Zernio account #1) |
+| YouTube | `NULL` | the same key (Zernio account #1) |
+| Instagram | `account-2` | the slot key (Zernio account #2) |
+
+Resolution is deliberately **one-directional**: a destination naming a slot that
+has no credential does *not* fall back to the default. Falling back would submit
+a post to whichever account happened to be the default — the wrong platform
+account, silently, with a plausible success response. It reports
+`no_credential` instead.
+
+`GET /api/publishing/admin/groups/{id}/accounts` reads the accounts each of the
+group's keys can actually see (`supports_account_listing`), which is how an
+operator maps a destination to the right slot without guessing at account refs.
+Status 200 groups get an empty listing and are unaffected.
 
 The destination, not the group, is the unit of publication. A group only ever
 *expands* into destinations, which is what lets one code path serve all three
@@ -98,10 +136,15 @@ In the dashboard: **Publishing** tab.
 2. **Set its credential** (`PUT /api/publishing/admin/groups/{id}/credential`).
    The key is sealed before it touches the database and probed against the
    provider by default (`?verify=true`). Each group has its **own** credential;
-   one key never controls all groups.
-3. **Add destinations** (`POST .../groups/{id}/destinations`) — one row per
-   connected account: platform + the provider's account ref.
-4. **Publish** (`POST /api/publishing/publish`) with any mix of
+   one key never controls all groups. Pass `credential_slot` to add a *second*
+   provider account to the same group instead of replacing the first.
+3. *(multi-account only)* **See what each key can reach** —
+   `GET .../groups/{id}/accounts` lists the connected accounts per slot, so the
+   next step uses real account refs rather than guesses.
+4. **Add destinations** (`POST .../groups/{id}/destinations`) — one row per
+   connected account: platform + the provider's account ref, plus the
+   `credential_slot` that can see it (omit for the group default).
+5. **Publish** (`POST /api/publishing/publish`) with any mix of
    `destination_ids` and `group_ids`.
 
 `POST /api/publishing/preview` runs the identical expansion and the same
@@ -117,7 +160,8 @@ Public (`/api/publishing`): `health`, `destinations`, `preview`, `publish`,
 
 Admin (`/api/publishing/admin`): `health`, `groups` CRUD,
 `groups/{id}/credential` (`PUT`/`DELETE`/`verify`), `groups/{id}/credentials`
-(masked history), `destinations` CRUD, `groups/{id}/assignments`, `assignments`,
+(masked history), `groups/{id}/accounts` (provider-side account listing per
+slot), `destinations` CRUD, `groups/{id}/assignments`, `assignments`,
 `groups/{id}/capacity`, `schedule/run`, `events`, `dry-run`, `dry-run/reset`.
 
 ## Security model
@@ -317,7 +361,9 @@ de-synchronize the herd when a provider outage fails every post at once.
 **Queue claiming** is `FOR UPDATE SKIP LOCKED` against Postgres. No Celery, no
 Redis, no broker. A stale sweeper moves attempts that were handed over but never
 confirmed (`PUBLISHING_SUBMIT_TIMEOUT`, default 30 min) to `unknown`, and
-`recover_stale_on_boot` reclaims anything a killed worker left `in_flight`.
+`recover_stale_on_boot` reclaims anything a killed worker left `in_flight`. For a
+pollable provider the sweeper is now the *second* line rather than the only one —
+the status poll runs first and usually resolves the post before the timeout can.
 
 ## Provider abstraction
 
@@ -336,8 +382,10 @@ tells us to "poll **action** `check_job_status`". Treat `supports_status_lookup`
 as unmeasured rather than settled — see `status200.fetch_status`. Given the flags
 as they stand:
 
-- there is **no polling loop**; webhooks are the only completion signal and the
-  stale sweeper is the safety net;
+- there is **no polling loop for a provider that declares
+  `supports_status_lookup=False`**; webhooks are its only completion signal and
+  the stale sweeper is the safety net. A provider that *can* be asked (Zernio)
+  gets a poll — see [Status polling](#status-polling) below;
 - scheduling is **held here, not by the provider**. `supports_remote_schedule`
   exists so a provider can take a slot off our hands, and Status 200 documents
   exactly that (`post.scheduledFor`, docs v1.4.0) — but it declares `False`,
@@ -356,8 +404,10 @@ as they stand:
   at once. At `False` each attempt stays parked on its own slot and *this
   process* submits when the slot arrives — correct spacing, but the container has
   to be running at every slot, which only an always-on host removes.
-  `PUBLISHING_REMOTE_SCHEDULE` (`auto`|`on`|`off`) overrides; `auto` currently
-  behaves as `off` since nothing declares support.
+  `PUBLISHING_REMOTE_SCHEDULE` (`auto`|`on`|`off`) overrides; under `auto` a
+  **Status 200** slot is still held here, while a **Zernio** slot is handed to the
+  provider, which declares — and on measurement honours — both
+  `supports_remote_schedule` and `supports_cancel_scheduled`.
   Two fallbacks guard the day a provider claims support again, because a schedule
   that quietly doesn't happen is worse than one that's refused: a 4xx naming the
   field flips the process to the local clock
@@ -378,6 +428,78 @@ produced the failure. The taxonomy is `PERMANENT` / `TRANSIENT` / `CAPACITY` /
 mean the destination or the credential is broken rather than the post — so the
 day's remaining posts don't each rediscover it.
 
+### Status polling
+
+A provider that declares `supports_status_lookup=True` (Zernio) exposes a status
+endpoint, so `dispatcher.poll_submitted_attempts` runs one pass per
+reconciliation and *asks* whether each `submitted` post has gone live — the
+completion signal a webhook alone used to be. It runs **before**
+`sweep_stale_submitted` and in its own transaction: a post that can be asked
+about must be asked before the timeout condemns it to `unknown` (terminal,
+needs a human), and the provider I/O must not hold the sweeps' transaction open.
+For Status 200 (`supports_status_lookup=False`) the pass is a no-op — its
+attempts never match the provider filter, so the sweeper stays their only
+backstop, exactly as before.
+
+An answer routes through the **same** service calls a submit or a webhook would;
+the poll invents no transition the state machine forbids. `fetch_status` has a
+three-way contract:
+
+- a `SubmitResult` with `status="succeeded"` → the post is confirmed. Applied the
+  way the webhook handler applies it, **not** via `record_success`, because that
+  helper stamps `submitted_at = now` (rewriting when the post was handed over to
+  when we happened to ask) and logs its own line;
+- `None` → *no information*: an unreachable provider, or a 404 that a deleted post
+  and a never-valid ref share. Not evidence of failure — left for the sweeper's
+  `unknown`;
+- a raised `ProviderError` → if `is_ambiguous` (`E_UNKNOWN`) the post **stays
+  `submitted`** (recording it as failed could retry a live post — a second video
+  on a real feed); otherwise it is a verdict about the post and goes through
+  `record_failure`, so a destination-fatal one marks the account for re-linking
+  (`SUBMITTED → BLOCKED`) and a retryable one retries with backoff. Safe by
+  construction: a Zernio post-level verdict can reach `E_ACCOUNT_AUTH` (one
+  destination) but **never `E_AUTH`** (`CREDENTIAL_FATAL`, the whole group), so a
+  poll can never disable a group's key.
+
+Rate-limited so a flapping provider cannot become a request flood: a post is left
+alone until `PUBLISHING_STATUS_POLL_MIN_AGE` (default 120 s) after submit, then
+re-asked no more than once per `PUBLISHING_STATUS_POLL_INTERVAL` (default 300 s),
+and at most `PUBLISHING_STATUS_POLL_BATCH` (default 20) posts per pass. The clock
+is the **persisted** `last_polled_at` column, not in-memory state, because two
+processes share the queue and either may restart; the attempt is stamped *before*
+the provider call, so an endpoint that 500s every lookup is still rate-limited.
+`state.poll_is_due` is the pure, CI-testable statement of those gates; the SQL
+`WHERE` is an index-friendly pre-filter the Python re-checks, so a drift between
+them can only ever skip a poll, never add one. The whole pass is off by setting
+`PUBLISHING_STATUS_POLL=0`, independent of any provider's capability.
+
+### Zernio specifics
+
+- **Media by URL**, same as Status 200 — the object-store staging path and the
+  bandwidth requirement below apply unchanged.
+- **Status lookups and account listing** are two capabilities Status 200 lacks.
+  Listing backs `groups/{id}/accounts`; lookups back the poll above.
+- **Real remote scheduling** is the third, and the one that changes deployment.
+  `supports_remote_schedule=True` **and** `supports_cancel_scheduled=True`:
+  `scheduledFor` + `timezone` returns `status: "scheduled"` with the timestamp
+  echoed, and `DELETE /v1/posts/{id}` cancels it. The orchestrator refuses to
+  hand the clock over without *both* — an uncancellable scheduled post is an
+  uncontrollable one — so for **Zernio** destinations the provider holds the
+  slot and nothing of ours needs to be awake when it arrives. This is the one
+  case the whole `deploy/publisher` always-on runbook exists to work around, and
+  Zernio removes it for its own destinations. `PUBLISHING_REMOTE_SCHEDULE`
+  (`auto`|`on`|`off`) still overrides; `auto` now actually hands the clock over
+  for Zernio, where before it behaved as `off` because nothing declared support.
+  The `remote_schedule_*` fallbacks stay armed regardless: the day Zernio starts
+  accepting-and-ignoring the field, hand-over disables itself after one post, not
+  a day's worth. Status 200 destinations are unaffected — they still declare
+  `False` and are held by the local clock.
+- **Multi-account is the point.** The credential-slot machinery above exists so a
+  group can span the two Zernio accounts a three-platform fan-out needs
+  (`multi_credential=True`), and a `PROFILE_OVER_LIMIT` 403 is classified
+  `E_PLAN_LIMIT` — the free tier's 2-accounts-per-key ceiling, not a post
+  failure.
+
 ### Quota
 
 Status 200's cap is **per platform per account** (free tier 5/day) and is only
@@ -396,22 +518,35 @@ silently become the system's ceiling.
 
 ```bash
 pytest tests/test_publishing_state.py tests/test_publishing_schedule.py \
-       tests/test_publishing_crypto.py tests/test_publishing_provider.py -v
+       tests/test_publishing_crypto.py tests/test_publishing_provider.py \
+       tests/test_publishing_zernio.py tests/test_publishing_webhooks.py \
+       tests/test_publishing_poll.py -v
 ```
 
-All four run in CI with no Postgres, no credentials and no network: the state
-machine, backoff, idempotency, error classification, webhook signatures and media
-tokens are pure functions; the provider suite runs against
-`httpx.MockTransport` fixtures and the fake adapter. `schedule` takes `now` as a
-parameter so the clock can be pinned.
+All of them run in CI with no Postgres, no credentials and no network: the state
+machine, backoff, idempotency, error classification, webhook signatures, media
+tokens and the poll cadence are pure functions; the provider and Zernio suites run
+against `httpx.MockTransport` fixtures and the fake adapter, and the poll suite
+drives `poll_submitted_attempts` against a stub session. `schedule` takes `now` as
+a parameter so the clock can be pinned, and so do `state.poll_is_due` and the
+poller.
+
+`tests/test_publishing_e2e.py` self-skips without Postgres — that is expected
+locally, not a failure.
 
 ## Migrations
 
 The boot path is `create_all` (`cloud.database.init_engine`); Alembic exists for
-controlled changes on top of it. `alembic/versions/20260809_publishing_baseline.py`
-is therefore written defensively — it inspects the live catalogue and creates only
-what is missing, so it is correct on a fresh database, on one that has already
-booted, and on one half-way between.
+controlled changes on top of it. Every revision here is therefore written
+defensively — it inspects the live catalogue and creates only what is missing, so
+each is correct on a fresh database, on one that has already booted, and on one
+half-way between.
+
+| Revision | Adds |
+|----------|------|
+| `20260809_publishing_baseline` | The nine tables and their constraints. |
+| `20260823_credential_slots` | `credential_slot` on `publish_credentials` and `publish_destinations` — the multi-account-per-group column. |
+| `20260824_status_poll` | `publish_attempts.last_polled_at` — the persisted poll clock. |
 
 ```bash
 DATABASE_URL=postgresql+asyncpg://... alembic upgrade head
@@ -432,7 +567,7 @@ DATABASE_URL=postgresql+asyncpg://... alembic upgrade head
 | `admin_auth.py` | Who may configure publishing. Fails closed. |
 | `media.py` | Public URL strategy + reachability warnings. |
 | `objectstore.py` | S3-compatible staging bucket: the fast media origin. |
-| `providers/` | `base.py` contract, `status200.py`, `fake.py`, registry. |
+| `providers/` | `base.py` contract, `status200.py`, `zernio.py`, `fake.py`, registry. |
 | `db.py` | Async engine/session for the publishing tables. |
 | `clips.py` | Reads finished clips out of a job — the seam to the video pipeline. |
 | `service.py` | Destination expansion, request/attempt creation, pre-flight. |

@@ -2,22 +2,44 @@ import { useState } from 'react';
 import {
   ChevronDown, ChevronRight, Loader2, Power, Trash2, Check, X, Pencil,
 } from 'lucide-react';
-import { updateGroup, deleteGroup } from '../../lib/publishing';
+import {
+  updateGroup, deleteGroup, groupSlots, slotLabel, credentialForSlot,
+} from '../../lib/publishing';
 import CredentialForm from './CredentialForm';
 import DestinationList from './DestinationList';
 import PostingPlanEditor from './PostingPlanEditor';
 
-// PublishGroupCard — one group: its key, its accounts, its state.
+// PublishGroupCard — one group: its keys, its accounts, its state.
 //
 // A group is a reusable bundle of accounts plus the credential that reaches
 // them. It is NOT the unit of publication: a publish can pick accounts across
 // groups, and every attempt row names its own destination. This card is the
 // place the operator configures the bundle, nothing more.
-export default function PublishGroupCard({ group, platforms, onChanged }) {
+//
+// "The credential" is singular only for a provider that connects every social
+// account under one key. Where a provider caps that (Zernio's free tier: two
+// accounts) a group holds several keys, one per credential slot, and the badges
+// below have to answer "can this batch publish?" across all of them — a group
+// whose default key is fine but whose second account has none is exactly as
+// stuck, for that platform, as a group with no key at all.
+export default function PublishGroupCard({ group, platforms, provider, onChanged }) {
+  // Every slot a destination or a key refers to, and which of them lack a usable
+  // key. Computed before state so the card can open itself on a problem.
+  // A brand-new group refers to no slot at all, so it is treated as having the
+  // one every group has — the default — which is what keeps "no key" showing on
+  // a group that has nothing in it yet.
+  const declaredSlots = groupSlots(group);
+  const slots = declaredSlots.length ? declaredSlots : [''];
+  const missingKeys = slots.filter((s) => !credentialForSlot(group, s));
+  const rejectedKeys = slots.filter((s) => credentialForSlot(group, s)?.invalid);
+  const hasAnyKey = missingKeys.length < slots.length;
+
   // Open by default when something needs doing — including a key the provider
-  // rejected, which is just as publish-stopping as a missing one.
+  // rejected, which is just as publish-stopping as a missing one, and including
+  // one bad key among several, which is otherwise invisible while collapsed.
   const [open, setOpen] = useState(
-    !group.credential || group.credential.invalid || !group.destinations?.length);
+    !group.destinations?.length
+    || missingKeys.length > 0 || rejectedKeys.length > 0);
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(group.name);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -84,11 +106,24 @@ export default function PublishGroupCard({ group, platforms, onChanged }) {
           </button>
         )}
 
-        <span className="readout">{group.provider}</span>
+        <span className="readout">{provider?.label || group.provider}</span>
         {!group.enabled && <span className="badge-quiet">paused</span>}
-        {!group.credential && <span className="badge-warn">no key</span>}
-        {group.credential?.invalid && <span className="badge-danger">key rejected</span>}
-        {!group.webhook_secret && group.credential && (
+        {/* Key health, per provider account. A single-key group reads exactly as
+            before ("no key" / "key rejected"); a multi-account batch names the
+            account, because "no key" on a batch that is publishing to two of
+            three platforms is a sentence the operator cannot act on. */}
+        {missingKeys.map((s) => (
+          <span key={`m${s}`} className="badge-warn">
+            {slots.length > 1 ? `no key · ${slotLabel(s)}` : 'no key'}
+          </span>
+        ))}
+        {rejectedKeys.map((s) => (
+          <span key={`r${s}`} className="badge-danger">
+            {slots.length > 1 ? `key rejected · ${slotLabel(s)}` : 'key rejected'}
+          </span>
+        ))}
+        {!group.webhook_secret && hasAnyKey
+          && (provider ? provider.supportsWebhooks : true) && (
           <span className="badge-warn" title="No webhook secret stored — provider
             callbacks cannot verify, so every post ages into needs-check">
             no webhook secret
@@ -150,12 +185,15 @@ export default function PublishGroupCard({ group, platforms, onChanged }) {
             <PostingPlanEditor group={group} onChanged={onChanged} />
           </section>
           <section>
-            <p className="eyebrow mb-2">credential</p>
-            <CredentialForm group={group} onSaved={onChanged} />
+            <p className="eyebrow mb-2">
+              {slots.length > 1 ? 'credentials' : 'credential'}
+            </p>
+            <CredentialForm group={group} provider={provider} onSaved={onChanged} />
           </section>
           <section>
             <p className="eyebrow mb-2">accounts</p>
-            <DestinationList group={group} platforms={platforms} onChanged={onChanged} />
+            <DestinationList group={group} platforms={platforms}
+              provider={provider} onChanged={onChanged} />
           </section>
         </div>
       )}

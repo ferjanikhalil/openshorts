@@ -28,6 +28,13 @@ E_MEDIA_TOO_LARGE = "media_too_large"  # exceeds the platform ceiling
 E_MEDIA_UNFETCHABLE = "media_unfetchable"  # provider could not download the URL
 E_UNSUPPORTED = "unsupported"          # platform rejects this media/option
 E_DUPLICATE = "duplicate"              # provider says it already has this post
+# The provider's PLAN refuses this, not the request: a free tier that connects
+# only N social accounts, a feature gated behind an upgrade. Distinct from
+# E_AUTH (the key works fine) and from E_NOT_CONNECTED (the account may be
+# perfectly linked) because the fix is neither a new key nor a re-link — it is a
+# billing or account-topology decision only a human can make. Retrying spends
+# quota on a post that cannot succeed until then.
+E_PLAN_LIMIT = "plan_limit"
 
 # Transient — retry with backoff.
 E_NETWORK = "network"
@@ -54,7 +61,7 @@ E_REMOTE_SCHEDULE = "remote_schedule_unsupported"
 
 PERMANENT = frozenset({
     E_AUTH, E_ACCOUNT_AUTH, E_NOT_CONNECTED, E_VALIDATION, E_MEDIA_TOO_LARGE,
-    E_MEDIA_UNFETCHABLE, E_UNSUPPORTED, E_DUPLICATE,
+    E_MEDIA_UNFETCHABLE, E_UNSUPPORTED, E_DUPLICATE, E_PLAN_LIMIT,
 })
 TRANSIENT = frozenset({E_NETWORK, E_TIMEOUT, E_PROVIDER_5XX, E_MEDIA_PENDING})
 CAPACITY = frozenset({E_RATE_LIMITED, E_QUOTA_EXHAUSTED})
@@ -124,6 +131,8 @@ def classify_http_status(status: int, body: Optional[dict] = None) -> str:
     body = body or {}
     if status == 401:
         return E_AUTH
+    if status == 402:
+        return E_PLAN_LIMIT
     if status == 403:
         return E_NOT_CONNECTED
     if status == 404:

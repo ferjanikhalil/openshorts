@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import {
   publishingHealth, adminHealth, listGroups, createGroup,
-  setAdminToken, clearAdminToken,
+  setAdminToken, clearAdminToken, providerInfo,
 } from '../../lib/publishing';
 import SegmentedControl from '../ui/SegmentedControl';
 import PublishGroupCard from './PublishGroupCard';
@@ -32,6 +32,10 @@ export default function PublishingTab() {
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
+  // Which provider a new group posts through. '' = the server default. Only
+  // offered when more than one adapter is registered — with one provider there
+  // is no choice to make and the control would be noise.
+  const [newProvider, setNewProvider] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [tokenInput, setTokenInput] = useState('');
@@ -106,7 +110,9 @@ export default function PublishingTab() {
     if (!name) return;
     setBusy(true); setError('');
     try {
-      await createGroup({ name });
+      // provider omitted (null) means the server default, which is what a
+      // single-provider install always wants and what the picker preselects.
+      await createGroup({ name, provider: newProvider || null });
       setNewName(''); setCreating(false);
       await reload();
     } catch (err) {
@@ -139,6 +145,21 @@ export default function PublishingTab() {
 
   const warnings = [...(health.warnings || []), ...(admin?.warnings || [])];
   const platforms = admin?.platforms || [];
+  // What each provider can do, declared by the backend. Threaded into the cards
+  // so no form has to know a provider by name to label itself — the reason a
+  // second provider needed no new component. `providers` is absent until the
+  // admin identity is accepted, and providerInfo degrades to generic wording
+  // rather than rendering nothing.
+  const providerList = admin?.providers || [];
+  // Only providers that publish somewhere can be chosen for a new group. The
+  // dry-run adapter declares `simulated` and is filtered out here rather than by
+  // name — a group created on it would look ordinary and post nothing. Dry run
+  // is a mode of the whole subsystem (PUBLISHING_DRY_RUN), not a provider to
+  // pick, and while it is on every lookup already resolves to the fake anyway.
+  const selectableProviders = providerList.filter((p) => !p.simulated);
+  // The default provider's own name for itself, for copy written before any
+  // group exists and there is nothing to read a provider off.
+  const defaultProvider = providerInfo(providerList, health.default_provider);
 
   return (
     <div className="mx-auto max-w-4xl space-y-5">
@@ -161,7 +182,7 @@ export default function PublishingTab() {
               lock
             </button>
           )}
-          <span className="readout">{health.default_provider}</span>
+          <span className="readout">{defaultProvider.label}</span>
         </div>
       </header>
 
@@ -246,14 +267,19 @@ export default function PublishingTab() {
           {groups.length === 0 && !creating && (
             <div className="card p-6 text-center">
               <p className="text-sm text-muted">
-                A group bundles the accounts that share one Status 200 API key.
-                Create one per key you hold.
+                A group bundles the accounts that share one {defaultProvider.label}{' '}
+                API key. Create one per key you hold
+                {defaultProvider.multiCredential
+                  ? ' — or one per batch, if you hold several keys that together '
+                    + 'cover the platforms you post to.'
+                  : '.'}
               </p>
             </div>
           )}
 
           {groups.map((g) => (
-            <PublishGroupCard key={g.id} group={g} platforms={platforms} onChanged={reload} />
+            <PublishGroupCard key={g.id} group={g} platforms={platforms}
+              provider={providerInfo(providerList, g.provider)} onChanged={reload} />
           ))}
 
           {creating ? (
@@ -265,14 +291,37 @@ export default function PublishingTab() {
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
               />
+              {selectableProviders.length > 1 && (
+                <select
+                  className="input-field w-auto grow-0 py-2 text-sm"
+                  title="Which provider this group posts through — fixed once created"
+                  value={newProvider}
+                  onChange={(e) => setNewProvider(e.target.value)}
+                >
+                  <option value="">{defaultProvider.label} (default)</option>
+                  {selectableProviders
+                    .filter((p) => p.name !== health.default_provider)
+                    .map((p) => (
+                      <option key={p.name} value={p.name}>{p.label || p.name}</option>
+                    ))}
+                </select>
+              )}
               <button type="submit" className="btn-primary py-2 text-xs" disabled={busy || !newName.trim()}>
                 {busy ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
                 Create
               </button>
               <button type="button" className="btn-ghost py-2 text-xs"
-                onClick={() => { setCreating(false); setNewName(''); }}>
+                onClick={() => { setCreating(false); setNewName(''); setNewProvider(''); }}>
                 Cancel
               </button>
+              {selectableProviders.length > 1 && (
+                <p className="w-full text-xs text-muted">
+                  The provider is fixed at creation: a group&rsquo;s keys,
+                  accounts and posting history all belong to one provider, so
+                  switching later would orphan every one of them. To move,
+                  create a second group and pause this one.
+                </p>
+              )}
             </form>
           ) : (
             <button className="btn-ghost w-full" onClick={() => setCreating(true)}>

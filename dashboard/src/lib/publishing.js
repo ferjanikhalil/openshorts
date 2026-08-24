@@ -116,16 +116,33 @@ export const deleteGroup = (id) => del(`${ADMIN}/groups/${id}?confirm=true`);
  * and no route anywhere returns the plaintext again. Callers must not keep the
  * value they passed in — clear the input on success.
  */
-export const setCredential = (groupId, apiKey, { kind = 'api_key', verify = true } = {}) =>
+export const setCredential = (
+  groupId, apiKey,
+  { kind = 'api_key', verify = true, slot = null } = {},
+) =>
   put(`${ADMIN}/groups/${groupId}/credential?verify=${verify ? 'true' : 'false'}`,
-    { api_key: apiKey, kind });
+    // `credential_slot` names WHICH provider account this key is. Sent as null
+    // (not omitted, not '') for the group default, which is the only shape a
+    // single-account provider ever has.
+    { api_key: apiKey, kind, credential_slot: slot || null });
 
 export const listCredentials = (groupId) =>
   jsonOrThrow(`${ADMIN}/groups/${groupId}/credentials`);
-export const verifyCredential = (groupId) =>
-  post(`${ADMIN}/groups/${groupId}/credential/verify`);
-export const revokeCredential = (groupId, kind = 'api_key') =>
-  del(`${ADMIN}/groups/${groupId}/credential?kind=${kind}`);
+// The accounts one stored key can reach. `accounts: null` means the provider
+// offers no listing — not an error, and the caller falls back to hand entry.
+export const listProviderAccounts = (groupId, slot = null) =>
+  jsonOrThrow(`${ADMIN}/groups/${groupId}/accounts${slot ? `?slot=${encodeURIComponent(slot)}` : ''}`);
+export const verifyCredential = (groupId, slot = null) =>
+  post(`${ADMIN}/groups/${groupId}/credential/verify${slot ? `?slot=${encodeURIComponent(slot)}` : ''}`);
+// Narrowest scope by default: no slot revokes the group DEFAULT key only, never
+// every account in a multi-account batch. `allSlots` is the deliberate wide one.
+export const revokeCredential = (groupId, kind = 'api_key',
+  { slot = null, allSlots = false } = {}) => {
+  const q = new URLSearchParams({ kind });
+  if (slot) q.set('slot', slot);
+  if (allSlots) q.set('all_slots', 'true');
+  return del(`${ADMIN}/groups/${groupId}/credential?${q}`);
+};
 
 // --- Destinations -----------------------------------------------------------
 export const createDestination = (groupId, body) =>
@@ -185,6 +202,95 @@ export const dryRunLog = () => jsonOrThrow(`${ADMIN}/dry-run`);
 export const dryRunReset = () => post(`${ADMIN}/dry-run/reset`);
 
 // --- Display helpers --------------------------------------------------------
+// Provider-specific prose. The FACTS about a provider (display name, key prefix,
+// whether several accounts fit in one batch) are declared in the backend's
+// Capabilities and arrive via adminHealth().providers — nothing here invents
+// them. What lives here is only the copy that tells an operator where to find an
+// account id, which is documentation, not capability, and which needs markup the
+// backend has no business carrying.
+//
+// A provider missing from this table still works: `providerInfo` falls back to
+// the declared label and generic wording. That fallback is the point — the next
+// adapter must not need a frontend change to be usable.
+export const PROVIDER_GUIDES = {
+  status200: {
+    accountRefLabel: 'profile UUID',
+    accountRefHint: 'profile uuid at the provider',
+    // Learned the hard way: their docs and their own "copy API ID" button both
+    // hand over the @handle, which the API rejects.
+    accountRefHelp: 'This is the profile UUID, not the @handle — the same value '
+      + 'for every platform under one profile. Their docs and the "copy API ID" '
+      + 'button both give the handle, which is rejected. Find it in the '
+      + 'dashboard at Connections with DevTools open (Network → the '
+      + 'social_media_profiles request → Preview → id).',
+  },
+  zernio: {
+    accountRefLabel: 'account id',
+    accountRefHint: 'account id at the provider',
+    accountRefHelp: 'This is the connected account’s id (a 24-character hex '
+      + 'string), one per social account rather than one per profile. Zernio can '
+      + 'list them: use Fetch accounts above instead of typing it, which also '
+      + 'proves the key reaches the account.',
+  },
+};
+
+const GENERIC_GUIDE = {
+  accountRefLabel: 'account id',
+  accountRefHint: 'account id at the provider',
+  accountRefHelp: 'The identifier the provider uses for this connected account. '
+    + 'It is passed through untouched, so it has to be exactly what they expect.',
+};
+
+/**
+ * Everything the UI needs to render forms for one provider.
+ *
+ * `providers` is adminHealth().providers. An unknown or absent name still returns
+ * a usable object — a form that cannot label itself must still let the operator
+ * paste a key.
+ */
+export function providerInfo(providers, name) {
+  const declared = (providers || []).find((p) => p.name === name) || {};
+  return {
+    name: name || declared.name || 'provider',
+    label: declared.label || name || 'provider',
+    keyPrefix: declared.key_prefix || '',
+    multiCredential: !!declared.multi_credential,
+    supportsAccountListing: !!declared.supports_account_listing,
+    supportsRemoteSchedule: !!declared.supports_remote_schedule,
+    supportsStatusLookup: !!declared.supports_status_lookup,
+    supportsWebhooks: !!declared.supports_webhooks,
+    platforms: declared.platforms || [],
+    ...(PROVIDER_GUIDES[name] || GENERIC_GUIDE),
+  };
+}
+
+/**
+ * The credential slots present in one group, default first.
+ *
+ * Derived from the group's own credentials and destinations rather than a fixed
+ * list: a slot exists because the operator named it. Destinations are included so
+ * a slot a destination points at still shows up after its key was revoked —
+ * which is exactly the state that stops that destination publishing and so the
+ * one that must be visible.
+ */
+export function groupSlots(group) {
+  const slots = new Set();
+  for (const c of group?.credentials || []) {
+    if (c?.kind !== 'webhook_secret') slots.add(c.credential_slot || '');
+  }
+  for (const d of group?.destinations || []) slots.add(d.credential_slot || '');
+  const named = [...slots].filter(Boolean).sort();
+  return slots.has('') ? ['', ...named] : named;
+}
+
+export const slotLabel = (slot) => slot || 'default account';
+
+/** The api_key credential for one slot ('' = the group default), or undefined. */
+export const credentialForSlot = (group, slot) =>
+  (group?.credentials || []).find(
+    (c) => c.kind !== 'webhook_secret' && (c.credential_slot || '') === (slot || ''),
+  );
+
 export const PLATFORM_LABELS = {
   youtube: 'YouTube',
   instagram: 'Instagram',

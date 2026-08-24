@@ -16,7 +16,7 @@ import uuid
 
 from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, func,
+    UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
@@ -58,7 +58,7 @@ class PublishGroup(Base):
 
 
 class PublishCredential(Base):
-    """An encrypted provider secret. One row per (group, kind) generation.
+    """An encrypted provider secret. One row per (group, kind, slot) generation.
 
     Rotation is by-insert: a new row supersedes the old one, and the old row is
     retained (revoked, not deleted) so the audit trail explains which credential
@@ -67,6 +67,14 @@ class PublishCredential(Base):
     ``kind`` separates the outbound API key from the inbound webhook signing
     secret. They are different secrets with different blast radii and the AAD
     binds each ciphertext to its kind.
+
+    ``credential_slot`` is what allows MORE THAN ONE provider account behind one
+    group. It exists because of a hard external limit: Zernio's free tier
+    connects 2 social accounts per Zernio account, and a full fan-out needs 3
+    (TikTok + Instagram + YouTube). So a group holds several API keys, each
+    labelled with a slot, and a destination names the slot it publishes through.
+    NULL means "the group default" — which is exactly what every pre-existing
+    Status 200 group is, so nothing about a one-key group changes.
     """
     __tablename__ = "publish_credentials"
 
@@ -77,6 +85,11 @@ class PublishCredential(Base):
     provider = Column(String(40), nullable=False)
     # 'api_key' | 'webhook_secret'
     kind = Column(String(30), nullable=False, default="api_key")
+    # Operator-chosen label naming ONE provider account inside this group, e.g.
+    # "zernio-a". NULL = the group's default credential (the only shape that
+    # existed before multi-account support, and still the only one Status 200
+    # uses).
+    credential_slot = Column(String(32), nullable=True)
 
     # --- sealed material (see crypto.encrypt) ---
     key_version = Column(String(20), nullable=False)
@@ -98,8 +111,26 @@ class PublishCredential(Base):
     revoked_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
+        # The credential lookup carries the slot, because resolution is
+        # slot-then-default: a destination's own slot first, falling back to the
+        # NULL-slot group default.
         Index("ix_publish_credentials_lookup",
-              "publish_group_id", "kind", "active"),
+              "publish_group_id", "kind", "credential_slot", "active"),
+        # At most one ACTIVE credential per named slot. "Rotation is by-insert"
+        # is enforced in application code by the revoke sweep in admin_api; this
+        # pins it in the schema so a concurrent write cannot leave two live keys
+        # in one slot and make dispatch's choice arbitrary.
+        #
+        # Restricted to non-NULL slots on purpose. Postgres treats NULLs as
+        # distinct in a unique index, so the group default would not be covered
+        # anyway, and that is exactly the pre-existing behaviour for the
+        # pre-existing shape.
+        Index("uq_credential_active_per_slot",
+              "publish_group_id", "kind", "credential_slot",
+              unique=True,
+              postgresql_where=text(
+                  "active AND revoked_at IS NULL "
+                  "AND credential_slot IS NOT NULL")),
     )
 
 
@@ -127,6 +158,11 @@ class PublishDestination(Base):
     provider_account_ref = Column(String(255), nullable=False)
     # Human label for the UI, e.g. "@openshorts_es". Cosmetic only.
     display_name = Column(String(255), nullable=True)
+    # Which provider account (credential slot) this destination publishes
+    # through. NULL = the group's default credential, which is every Status 200
+    # destination and every single-key group. Only matters when one group holds
+    # several provider accounts — see PublishCredential.credential_slot.
+    credential_slot = Column(String(32), nullable=True)
 
     enabled = Column(Boolean, nullable=False, default=True)
     # 'unverified' | 'ok' | 'blocked' | 'disconnected'
@@ -304,6 +340,13 @@ class PublishAttempt(Base):
     claimed_at = Column(DateTime(timezone=True), nullable=True)
     claimed_by = Column(String(80), nullable=True)
     submitted_at = Column(DateTime(timezone=True), nullable=True)
+    # When the provider was last asked "is this post live?". Only providers that
+    # declare `supports_status_lookup` are ever polled, so this stays NULL for
+    # the rest — and that is the point of storing it rather than deriving it: it
+    # is what rate-limits the poller to one question per post per interval
+    # instead of one per reconciliation tick, and it survives a restart, so a
+    # process that flaps does not turn into a request flood.
+    last_polled_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(),

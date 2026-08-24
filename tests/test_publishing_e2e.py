@@ -1112,3 +1112,229 @@ class TestRhythmAndRemoteSchedule:
             assert elapsed >= 0.9, f"gap not enforced ({elapsed:.2f}s)"
         run(go())
 
+
+# --- several provider accounts inside one batch ------------------------------
+async def _slot_group(name="multi", provider="zernio",
+                      default_key="rl_test_defaultkeyaaaaaaaa",
+                      slots=(("zernio-a", ("tiktok", "youtube")),
+                             ("zernio-b", ("instagram",)))):
+    """One group, one credential per slot, destinations mapped to those slots.
+
+    The shape the whole credential-slot mechanism exists for: Zernio's free tier
+    connects 2 social accounts per Zernio account, and the usual fan-out needs 3.
+    Two Zernio keys therefore live in ONE group, and each destination names the
+    slot whose key can actually reach it.
+
+    A default (NULL-slot) credential is created alongside them on purpose — it is
+    what the one-directional fallback tests need something to NOT fall back to.
+    """
+    async with pdb.session() as s:
+        g = m.PublishGroup(name=name, provider=provider, enabled=True)
+        s.add(g)
+        await s.flush()
+
+        def _cred(key, slot):
+            aad = (f"group:{g.id}|kind:api_key|provider:{provider}"
+                   + (f"|slot:{slot}" if slot else ""))
+            return m.PublishCredential(
+                publish_group_id=g.id, provider=provider, kind="api_key",
+                credential_slot=slot, active=True,
+                **crypto.encrypt(key, aad=aad))
+
+        s.add(_cred(default_key, None))
+        dests = {}
+        for slot, platforms in slots:
+            slot_key = "rl_test_key_" + slot.replace("-", "_")
+            s.add(_cred(slot_key, slot))
+            for p in platforms:
+                d = m.PublishDestination(
+                    publish_group_id=g.id, provider=provider, platform=p,
+                    provider_account_ref=f"acct_{slot}_{p}", enabled=True,
+                    credential_slot=slot, health="unverified",
+                    display_name=f"{slot} {p}")
+                s.add(d)
+                dests[p] = d
+        await s.flush()
+        await s.commit()
+        return g.id, {p: d.id for p, d in dests.items()}
+
+
+class TestCredentialSlots:
+    """Resolution of destination → credential when a group holds several keys."""
+
+    def test_three_platforms_publish_through_two_provider_accounts(self):
+        """The requirement in one test: a 2-account provider covering 3 platforms.
+
+        Before slots this needed the batch split in two, which also split the
+        schedule, the audit trail and the duplicate guard.
+        """
+        async def go():
+            _, dests = await _slot_group(name="three-on-two")
+            req_id, _ = await _publish("job-slots", 0, list(dests.values()))
+            outcomes = await _drain()
+            assert outcomes == ["submitted"] * 3, outcomes
+            rows = await _attempts(req_id)
+            assert {r.status for r in rows} == {state.SUBMITTED}
+            # One post per platform: none missed, none doubled.
+            assert sorted(s["platform"] for s in fake.submissions) == \
+                ["instagram", "tiktok", "youtube"]
+        run(go())
+
+    def test_each_destination_signs_with_its_own_slots_key(self):
+        """The point of the mapping: the right key reaches the right account.
+
+        Signing Instagram with account A's key is what a provider answers as "no
+        such account connected" — after the submit, having spent an attempt, with
+        an error that reads like a disconnected social account.
+        """
+        async def go():
+            _, dests = await _slot_group(name="per-slot-key")
+            await _publish("job-slots2", 0, list(dests.values()))
+            await _drain()
+            signed = {s["platform"]: s["api_key_fp"] for s in fake.submissions}
+            assert signed["tiktok"] == signed["youtube"] \
+                == fake.key_fingerprint("rl_test_key_zernio_a")
+            assert signed["instagram"] == \
+                fake.key_fingerprint("rl_test_key_zernio_b")
+            # And never the group default, which no destination names.
+            assert fake.key_fingerprint("rl_test_defaultkeyaaaaaaaa") \
+                not in signed.values()
+        run(go())
+
+    def test_an_unslotted_destination_uses_the_group_default(self):
+        async def go():
+            gid, _ = await _slot_group(name="mixed")
+            async with pdb.session() as s:
+                d = m.PublishDestination(
+                    publish_group_id=gid, provider="zernio", platform="youtube",
+                    provider_account_ref="acct_default_yt", enabled=True,
+                    credential_slot=None, health="unverified",
+                    display_name="default yt")
+                s.add(d)
+                await s.flush()
+                dest_id = d.id
+                await s.commit()
+            await _publish("job-slots3", 0, [dest_id])
+            await _drain()
+            assert [s["api_key_fp"] for s in fake.submissions] == \
+                [fake.key_fingerprint("rl_test_defaultkeyaaaaaaaa")]
+        run(go())
+
+    def test_a_slotted_destination_never_falls_back_to_the_default_key(self):
+        """One-directional on purpose.
+
+        Falling back would submit with a key that cannot reach the account.
+        Parking says which slot is missing instead.
+        """
+        async def go():
+            gid, dests = await _slot_group(name="no-fallback")
+            async with pdb.session() as s:
+                await s.execute(delete(m.PublishCredential).where(
+                    m.PublishCredential.publish_group_id == gid,
+                    m.PublishCredential.credential_slot == "zernio-b"))
+                await s.commit()
+
+            req_id, _ = await _publish("job-slots4", 0, [dests["instagram"]])
+            assert await _drain(rounds=1) == ["no_credential"]
+            rows = await _attempts(req_id)
+            assert rows[-1].status == state.DEFERRED
+            assert rows[-1].error_code == "no_credential"
+            # The message has to name the slot, or the operator is staring at a
+            # group that visibly HAS a key.
+            assert "zernio-b" in rows[-1].error_message
+            assert fake.submissions == []
+        run(go())
+
+    def test_one_dead_slot_leaves_the_other_publishing(self):
+        """A 401 on one provider account must not disable the whole group.
+
+        Marking the group's newest key instead of the destination's own is how a
+        single expired account took every platform offline on 2026-08-17;
+        resolution goes through the destination for exactly this reason.
+        """
+        async def go():
+            gid, dests = await _slot_group(name="one-dead")
+            async with pdb.session() as s:
+                cred = (await s.execute(select(m.PublishCredential).where(
+                    m.PublishCredential.publish_group_id == gid,
+                    m.PublishCredential.credential_slot == "zernio-b"
+                ))).scalar_one()
+                cred.invalid_at = datetime.now(timezone.utc)
+                cred.invalid_reason = "provider said: key revoked"
+                await s.commit()
+
+            req_id, _ = await _publish("job-slots5", 0, list(dests.values()))
+            outcomes = await _drain()
+            assert sorted(outcomes) == ["no_credential", "submitted", "submitted"]
+            posted = sorted(s["platform"] for s in fake.submissions)
+            assert posted == ["tiktok", "youtube"], posted
+            parked = [r for r in await _attempts(req_id)
+                      if r.error_code == "no_credential"]
+            assert len(parked) == 1
+            assert "zernio-b" in parked[0].error_message
+        run(go())
+
+    def test_a_slots_key_rotates_without_touching_the_other_slot(self):
+        async def go():
+            gid, dests = await _slot_group(name="rotate")
+            async with pdb.session() as s:
+                aad = f"group:{gid}|kind:api_key|provider:zernio|slot:zernio-a"
+                s.add(m.PublishCredential(
+                    publish_group_id=gid, provider="zernio", kind="api_key",
+                    credential_slot="zernio-a", active=True,
+                    **crypto.encrypt("rl_test_key_rotated_aaaa", aad=aad)))
+                await s.commit()
+
+            await _publish("job-slots6", 0, list(dests.values()))
+            await _drain()
+            signed = {s["platform"]: s["api_key_fp"] for s in fake.submissions}
+            # Newest-active-per-slot, and only for the slot that rotated.
+            assert signed["tiktok"] == \
+                fake.key_fingerprint("rl_test_key_rotated_aaaa")
+            assert signed["instagram"] == \
+                fake.key_fingerprint("rl_test_key_zernio_b")
+        run(go())
+
+    def test_the_admin_view_lists_one_credential_per_slot_default_first(self):
+        async def go():
+            gid, _ = await _slot_group(name="listing")
+            async with pdb.session() as s:
+                rows = await service.active_credentials(s, gid)
+            assert [r.credential_slot for r in rows] == \
+                [None, "zernio-a", "zernio-b"]
+            assert all(r.last4 for r in rows)
+        run(go())
+
+    def test_asking_for_the_default_slot_is_not_asking_for_any_slot(self):
+        """``slot=None`` and an omitted ``slot`` are different questions.
+
+        Conflating them lets a group-wide lookup answer with a slotted key it has
+        no business using — the same class of bug as the fallback, one level up.
+        """
+        async def go():
+            gid, _ = await _slot_group(name="slot-vs-any")
+            async with pdb.session() as s:
+                explicit_default = await service.active_credential(s, gid,
+                                                                   slot=None)
+                slotted = await service.active_credential(s, gid,
+                                                          slot="zernio-a")
+                any_slot = await service.active_credential(s, gid)
+            assert explicit_default.credential_slot is None
+            assert slotted.credential_slot == "zernio-a"
+            assert any_slot is not None       # "any" still answers
+        run(go())
+
+    def test_a_group_with_only_slotted_keys_has_no_default(self):
+        async def go():
+            gid, _ = await _slot_group(name="slots-only")
+            async with pdb.session() as s:
+                await s.execute(delete(m.PublishCredential).where(
+                    m.PublishCredential.publish_group_id == gid,
+                    m.PublishCredential.credential_slot.is_(None)))
+                await s.commit()
+                assert await service.active_credential(s, gid, slot=None) is None
+                # ...but the slotted keys are still perfectly usable.
+                assert await service.active_credential(
+                    s, gid, slot="zernio-a") is not None
+        run(go())
+

@@ -43,6 +43,9 @@ MEDIA_TTL_SECONDS = 7 * 24 * 3600
 
 CAPABILITIES = Capabilities(
     name="fake",
+    label="Dry run",
+    key_prefix="rl_",
+    simulated=True,
     platforms=(plat.YOUTUBE, plat.INSTAGRAM, plat.TIKTOK),
     supports_media_refs=True,
     media_by_url=True,
@@ -79,6 +82,17 @@ def remote_schedule_disable(reason: str) -> None:
 # Everything the fake did, for assertions and for the dry-run admin view.
 submissions = []
 uploads = []
+
+
+def key_fingerprint(api_key: str) -> str:
+    """Stable, non-reversible id for whichever key signed a submit.
+
+    Exposed so a test can name the key it expects without either side ever
+    holding plaintext next to the record. Salted with a fixed label so the digest
+    cannot be compared against a hash of the key computed anywhere else.
+    """
+    return hashlib.sha256(b"openshorts-fake-keyfp\x00"
+                          + (api_key or "").encode()).hexdigest()[:12]
 
 
 def reset():
@@ -134,6 +148,16 @@ class FakeProvider:
         record = {
             "platform": plat.normalize(payload.platform),
             "account": payload.provider_account_ref,
+            # WHICH key signed this, as a non-reversible 12-hex digest — never
+            # the key itself. Recording the plaintext would put a live provider
+            # key in a module-level list that the dry-run admin view reads, which
+            # is precisely what the sealed-credential design exists to prevent.
+            # A digest is enough for the only question anyone asks of it: did
+            # these two destinations publish through the same provider account?
+            # That is how the credential-slot mapping is verified — a group can
+            # hold several keys, and the mapping is only correct if each
+            # destination's submit carries its own slot's key.
+            "api_key_fp": key_fingerprint(api_key),
             "caption": payload.caption,
             "media_ref": payload.media_ref,
             "scheduled_for": (payload.scheduled_for.isoformat()

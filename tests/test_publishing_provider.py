@@ -1023,3 +1023,71 @@ class TestFakeProvider:
         run(fake.PROVIDER.submit(API_KEY, payload()))
         fake.reset()
         assert fake.submissions == [] and fake.uploads == []
+
+
+class TestTheFakeLedgerHoldsNoPlaintextKey:
+    """`fake.submissions` is not a private test buffer.
+
+    The dry-run admin view reads it, so anything recorded there is rendered in a
+    browser. Recording the api_key to make slot mapping assertable would have put
+    a live provider key in exactly the place the sealed-credential design exists
+    to keep it out of — and dry run is also how an operator tries out a real key
+    before publishing with it.
+    """
+
+    LIVE_LOOKING_KEY = "rl_live_9f2c4b7a1d8e6350"
+
+    def setup_method(self):
+        fake.reset()
+
+    def test_the_key_appears_nowhere_in_the_record(self):
+        run(fake.PROVIDER.submit(self.LIVE_LOOKING_KEY, payload()))
+        blob = json.dumps(fake.submissions[-1], default=str)
+        assert self.LIVE_LOOKING_KEY not in blob
+        # Not even a prefix long enough to be worth guessing from.
+        assert self.LIVE_LOOKING_KEY[:12] not in blob
+
+    def test_a_failed_submit_records_no_key_either(self):
+        # The failure branches append the record before raising, so they are the
+        # easy place for a leak to hide.
+        with pytest.raises(errors.ProviderError):
+            run(fake.PROVIDER.submit(self.LIVE_LOOKING_KEY,
+                                     payload(caption="clip fail-auth")))
+        assert self.LIVE_LOOKING_KEY not in json.dumps(
+            fake.submissions[-1], default=str)
+
+    def test_the_uploads_ledger_is_clean_too(self):
+        run(fake.PROVIDER.upload_media(self.LIVE_LOOKING_KEY,
+                                       media_url="https://cdn.example.test/c.mp4"))
+        assert self.LIVE_LOOKING_KEY not in json.dumps(fake.uploads,
+                                                       default=str)
+
+    def test_the_fingerprint_identifies_the_key_without_revealing_it(self):
+        fp = fake.key_fingerprint(self.LIVE_LOOKING_KEY)
+        assert fp == fake.key_fingerprint(self.LIVE_LOOKING_KEY)
+        assert len(fp) == 12
+        assert self.LIVE_LOOKING_KEY not in fp
+        assert fp != fake.key_fingerprint(self.LIVE_LOOKING_KEY + "x")
+
+    def test_two_destinations_on_one_key_are_recognisable_as_such(self):
+        """What the digest is for: reading the credential-slot mapping.
+
+        A multi-account group holds several keys, and the mapping is only correct
+        if each destination's submit carried its own slot's key. That question is
+        answerable from digests alone.
+        """
+        run(fake.PROVIDER.submit("rl_test_key_a", payload(caption="one")))
+        run(fake.PROVIDER.submit("rl_test_key_a", payload(caption="two")))
+        run(fake.PROVIDER.submit("rl_test_key_b", payload(caption="three")))
+        fps = [s["api_key_fp"] for s in fake.submissions]
+        assert fps[0] == fps[1]
+        assert fps[2] != fps[0]
+        assert fps[2] == fake.key_fingerprint("rl_test_key_b")
+
+    def test_the_digest_is_salted_against_an_offline_comparison(self):
+        # A bare sha256 of the key could be recomputed by anyone holding a
+        # candidate key and matched against a record. The fixed label means the
+        # digest only means something inside this module.
+        import hashlib
+        bare = hashlib.sha256(self.LIVE_LOOKING_KEY.encode()).hexdigest()[:12]
+        assert fake.key_fingerprint(self.LIVE_LOOKING_KEY) != bare

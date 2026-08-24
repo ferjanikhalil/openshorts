@@ -10,7 +10,8 @@ from . import crypto, state
 
 
 def group_out(row, credential=None, destinations=None, summary=None,
-              webhook_secret=None, webhook_url=None) -> dict:
+              webhook_secret=None, webhook_url=None, credentials=None,
+              webhook_secrets=None) -> dict:
     return {
         "id": str(row.id),
         "name": row.name,
@@ -18,12 +19,24 @@ def group_out(row, credential=None, destinations=None, summary=None,
         "enabled": bool(row.enabled),
         "settings": row.settings or {},
         "created_at": row.created_at,
+        # The group's DEFAULT key (the NULL-slot row). Kept as a scalar field
+        # because it is the only shape a single-account group has ever had, and
+        # the UI reads it to answer "can this group publish at all?".
         "credential": credential,
+        # Every key in the group, default first, then one per named slot. A
+        # multi-account provider needs the list; a single-account one returns a
+        # one-element list whose only member is `credential` above.
+        "credentials": credentials if credentials is not None else (
+            [credential] if credential else []),
         # Masked like any other credential (presence + fingerprint, never the
         # secret). Its absence is the fact the UI needs: with no secret stored,
         # every provider callback fails verification and every post ages into
         # needs-check instead of being confirmed.
         "webhook_secret": webhook_secret,
+        # One signing secret per provider account: two Zernio accounts issue two
+        # independent secrets, and a callback from either has to verify.
+        "webhook_secrets": webhook_secrets if webhook_secrets is not None else (
+            [webhook_secret] if webhook_secret else []),
         "webhook_url": webhook_url,
         "destinations": destinations or [],
         "summary": summary,
@@ -36,6 +49,9 @@ def credential_out(row) -> dict:
         "id": str(row.id),
         "kind": row.kind,
         "provider": row.provider,
+        # Which provider account inside the group this key is. None = the
+        # group's default, which is every Status 200 credential ever stored.
+        "credential_slot": getattr(row, "credential_slot", None),
         "fingerprint": row.fingerprint,
         "last4": row.last4,
         # Reconstructed from last4 alone — the plaintext is never decrypted to
@@ -58,6 +74,9 @@ def destination_out(row) -> dict:
         "platform": row.platform,
         "provider_account_ref": row.provider_account_ref,
         "display_name": row.display_name,
+        # Which of the group's provider accounts owns this destination. None =
+        # the group's default credential.
+        "credential_slot": getattr(row, "credential_slot", None),
         "enabled": bool(row.enabled),
         "health": row.health,
         "health_detail": row.health_detail,
