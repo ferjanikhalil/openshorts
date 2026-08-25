@@ -27,6 +27,27 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+# One line per process, not per row: see the call site in run_due_assignments.
+_warned_no_resolver = False
+
+
+def _warn_no_clip_resolver_once() -> None:
+    """Say once that this process cannot convert assignments, and why.
+
+    Not an error. A publisher-role process is *meant* to hold no clip files, so
+    the useful signal is the single fact that assignment conversion is somebody
+    else's job here — repeated per row it would be noise, and per pass it would
+    still be noise.
+    """
+    global _warned_no_resolver
+    if _warned_no_resolver:
+        return
+    _warned_no_resolver = True
+    print("ℹ️  Publishing: no clip resolver on this process, so slotted "
+          "assignments are left pending for the host that owns the clip "
+          "files. Scheduling, dispatch and polling are unaffected.")
+
+
 def group_plan(group: PublishGroup) -> Optional[dict]:
     """The group's normalized posting rhythm, or None when it has none."""
     try:
@@ -345,6 +366,13 @@ async def run_due_assignments(session, limit: int = 50) -> int:
     A slot that passed while this machine was down is resolved by the group's
     catch-up policy: re-slot it, skip it, or publish immediately.
 
+    Conversion needs the clip, so it only happens on a process that has a clip
+    resolver. A publisher-role process runs everything else in this function —
+    catch-up re-slotting above all, which is the reason it is awake — and leaves
+    the conversion itself pending for the host that owns the files. Cancelling
+    there instead would be terminal, and would fire for every assignment it
+    reached.
+
     Claimed with ``FOR UPDATE SKIP LOCKED`` for the same reason the attempt queue
     is: two app replicas running the same reconciler tick must not both turn one
     assignment into a request, and the idempotency key would collapse them only
@@ -422,6 +450,23 @@ async def run_due_assignments(session, limit: int = 50) -> int:
 
         info = clips_mod.resolve(row.job_id, row.clip_index)
         if info is None or not info.get("filename"):
+            if not clips_mod.has_resolver():
+                # This process holds no clip files, so `None` here means "not
+                # mine to answer", not "gone" — and cancelling is permanent.
+                # Park instead, exactly as dispatcher._staged_info does for the
+                # same topology: the always-on publisher shares this queue with
+                # the machine that renders the clips, and only that machine can
+                # resolve one. Without this the publisher cancels every rhythm
+                # assignment it reaches, usually seconds after the slot is
+                # assigned and always before the rendering host gets a pass.
+                #
+                # Silent on purpose. For a publisher-role process this is every
+                # pending assignment on every reconcile pass, so an event here
+                # would bury the log; health already reports the absent resolver
+                # (`clip_resolver_registered`) and the row staying `pending` is
+                # itself visible. One print per process is the breadcrumb.
+                _warn_no_clip_resolver_once()
+                continue
             row.status = "cancelled"
             await service.log_event(
                 session, "assignment.clip_missing",
