@@ -99,7 +99,10 @@ class TestPollIsDue:
     def test_a_provider_parked_window_is_left_alone(self):
         """A future `deferred_until` on a SUBMITTED row is the provider's own
         window (a daily-cap 202). Silence before it is expected, not suspicious —
-        the same reading `sweep_stale_submitted` takes of the same field."""
+        the same reading `state.confirmation_is_overdue` takes of the same field.
+        Note the sweeper additionally waits out a remote-schedule `scheduled_for`
+        and this does not: asking early is wasted requests, answering early is
+        terminal."""
         assert state.poll_is_due(
             NOW, **due(deferred_until=NOW + timedelta(hours=2))) is False
 

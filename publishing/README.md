@@ -365,6 +365,19 @@ confirmed (`PUBLISHING_SUBMIT_TIMEOUT`, default 30 min) to `unknown`, and
 pollable provider the sweeper is now the *second* line rather than the only one —
 the status poll runs first and usually resolves the post before the timeout can.
 
+The timeout runs from the last moment the provider was expected to still be
+holding the post, not from the submit: the later of `attempt.deferred_until` (a
+window the provider asked for, e.g. a daily-cap 202) and `request.scheduled_for`
+(a schedule the provider agreed to keep). The second is not redundant — under
+remote-schedule hand-over the submit goes out *immediately* carrying
+`scheduledFor` and `promote_remote_schedules` **clears** `deferred_until`, because
+the local clock is no longer in charge. Reading only `deferred_until` condemned
+every remote-scheduled post: a rhythm slot hours out against a 30-minute timeout
+reached `unknown` long before it was due to go live, and `unknown` is terminal.
+`state.confirmation_is_overdue` is the authority (pure, CI-tested in
+`tests/test_publishing_sweeper.py`); the SQL is an index-friendly pre-filter it
+re-checks per row, so drift can only spare a post, never condemn one.
+
 ## Provider abstraction
 
 `providers/base.py` is the whole contract: five methods and a `Capabilities`

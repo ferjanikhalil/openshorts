@@ -730,29 +730,51 @@ async def retry_attempt(session, attempt_id, actor: Optional[str] = None,
 async def sweep_stale_submitted(session) -> int:
     """Move long-submitted attempts to ``unknown``.
 
-    This is the safety net that replaces polling: the provider has no verified
-    status-lookup endpoint, so an attempt whose webhook never arrives would sit
-    in ``submitted`` forever and hold the live-attempt slot. Moving it to
-    ``unknown`` surfaces it to a human WITHOUT retrying it.
+    This is the safety net for a provider that cannot be asked: with no verified
+    status-lookup endpoint, an attempt whose webhook never arrives would sit in
+    ``submitted`` forever and hold the live-attempt slot. Moving it to ``unknown``
+    surfaces it to a human WITHOUT retrying it.
 
-    A submitted attempt carrying a future ``deferred_until`` is a post the
-    provider deliberately parked for a later window (a daily-cap 202). Silence
-    before that window is expected, not suspicious, so it is left alone until
-    the window has passed and the usual timeout has run from there.
+    Which makes a false positive expensive: ``unknown`` is terminal and never
+    auto-retried, so condemning a post the provider is still legitimately holding
+    strands a clip that was going to publish fine. Two timestamps say "still
+    holding", and both must be waited out — ``deferred_until`` (a window the
+    provider asked for) and the request's ``scheduled_for`` (a schedule the
+    provider agreed to keep, where ``deferred_until`` has been cleared by
+    ``dispatcher.promote_remote_schedules`` because the local clock is no longer
+    in charge). ``state.confirmation_is_overdue`` is the authority on both; the
+    SQL below is an index-friendly pre-filter that it re-checks per row.
     """
     cutoff = _now() - timedelta(seconds=settings.submit_timeout_seconds)
     rows = (await session.execute(
-        select(PublishAttempt)
+        select(PublishAttempt, PublishRequest.scheduled_for)
+        .join(PublishRequest,
+              PublishRequest.id == PublishAttempt.publish_request_id)
         .where(PublishAttempt.status == state.SUBMITTED,
                PublishAttempt.submitted_at.is_not(None),
                PublishAttempt.submitted_at < cutoff,
                (PublishAttempt.deferred_until.is_(None))
-               | (PublishAttempt.deferred_until < cutoff))
-        .with_for_update(skip_locked=True)
-    )).scalars().all()
-    for row in rows:
+               | (PublishAttempt.deferred_until < cutoff),
+               (PublishRequest.scheduled_for.is_(None))
+               | (PublishRequest.scheduled_for < cutoff))
+        # Only the attempt is locked: the request is joined to read one column,
+        # and locking it would contend with every other pass that touches the
+        # same request (refresh_request_status, dispatch, poll). The schedule
+        # comes back in this query rather than a per-row load, so there is no
+        # N+1 and no chance of reading a stale identity-mapped request.
+        .with_for_update(skip_locked=True, of=PublishAttempt)
+    )).all()
+    now = _now()
+    swept = 0
+    for row, scheduled_for in rows:
+        if not state.confirmation_is_overdue(
+                now, submitted_at=row.submitted_at,
+                deferred_until=row.deferred_until,
+                scheduled_for=scheduled_for,
+                timeout_seconds=settings.submit_timeout_seconds):
+            continue
         row.status = state.UNKNOWN
-        row.completed_at = _now()
+        row.completed_at = now
         row.error_code = "no_confirmation"
         row.error_message = (
             "No provider confirmation within "
@@ -764,7 +786,8 @@ async def sweep_stale_submitted(session) -> int:
                         destination_id=row.publish_destination_id,
                         group_id=row.publish_group_id)
         await refresh_request_status(session, row.publish_request_id)
-    return len(rows)
+        swept += 1
+    return swept
 
 
 def claim_is_recoverable(claimed_at, now, min_age_seconds: int) -> bool:

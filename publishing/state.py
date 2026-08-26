@@ -223,7 +223,12 @@ def poll_is_due(now, *, submitted_at, last_polled_at, deferred_until,
       never polled, which is due.
     * no future ``deferred_until``. On a submitted row that timestamp is a window
       the PROVIDER asked for (a daily-cap 202), so silence before it is expected
-      rather than suspicious — the same reading ``sweep_stale_submitted`` takes.
+      rather than suspicious — the same reading ``confirmation_is_overdue`` takes.
+      That function additionally waits out a remote-schedule ``scheduled_for``;
+      this one does not, and deliberately so. Asking early about a post the
+      provider is holding is merely wasted requests, and the answer ("scheduled")
+      is a useful liveness check — whereas answering early with ``unknown`` is
+      terminal.
     """
     submitted_at = _as_utc(submitted_at)
     if submitted_at is None:
@@ -241,6 +246,44 @@ def poll_is_due(now, *, submitted_at, last_polled_at, deferred_until,
     if last_polled_at is None:
         return True
     return (now - last_polled_at).total_seconds() >= max(0, int(interval_seconds))
+
+
+def confirmation_is_overdue(now, *, submitted_at, deferred_until, scheduled_for,
+                            timeout_seconds: int) -> bool:
+    """Has this submitted post been silent long enough to be called ``unknown``?
+
+    Pure for the same reason as ``poll_is_due``: the verdict it feeds is
+    ``unknown``, which is TERMINAL and never auto-retried, so the rule that
+    produces it has to be checkable without a database. ``sweep_stale_submitted``
+    expresses it as a SQL ``WHERE`` to keep the scan index-friendly and then
+    re-checks this function per row, so drift between the two can only spare a
+    post, never condemn one.
+
+    The timeout does not run from the submit — it runs from the last moment the
+    provider was expected to still be holding the post:
+
+    * ``deferred_until``, when the PROVIDER asked for a later window (a daily-cap
+      202). Silence before it is expected rather than suspicious.
+    * ``scheduled_for`` on the request, which is the case ``deferred_until``
+      cannot cover. Under remote-schedule hand-over the submit goes out
+      immediately carrying ``scheduledFor`` and the provider holds the clock;
+      ``dispatcher.promote_remote_schedules`` clears ``deferred_until`` precisely
+      because the local clock is no longer the one in charge. Reading only
+      ``deferred_until`` would therefore condemn every hand-over — a rhythm slot
+      hours out against a 30-minute timeout — before the post was ever due to go
+      live, destroying the capability the hand-over exists to provide.
+
+    A confirmation is only late once the latest of those has passed AND the usual
+    timeout has run from there.
+    """
+    submitted_at = _as_utc(submitted_at)
+    if submitted_at is None:
+        # Nothing was handed over that we know of, so there is no silence to
+        # measure and nothing to condemn.
+        return False
+    quiet_until = max(t for t in (submitted_at, _as_utc(deferred_until),
+                                  _as_utc(scheduled_for)) if t is not None)
+    return (now - quiet_until).total_seconds() >= max(0, int(timeout_seconds))
 
 
 # --- Idempotency ------------------------------------------------------------
